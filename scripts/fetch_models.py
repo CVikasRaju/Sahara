@@ -33,7 +33,7 @@ STT_REPOS = {
 }
 
 TTS_REPOS = {
-    "indic_tts": "ai4bharat/indic-tts",
+    "indic_tts": "ai4bharat/vits_rasa_13",
 }
 
 VAD_REPO = "onnx-community/silero-vad"
@@ -53,6 +53,10 @@ def download_repo(repo_id: str, target_dir: str, allow_patterns=None):
         print(f"  done: {repo_id}")
     except Exception as e:
         print(f"  FAILED: {repo_id}: {e}", file=sys.stderr)
+        if "401" in str(e) or "restricted" in str(e) or "gated" in str(e):
+            print("  [HuggingFace Auth Tip] This model repository is gated or restricted. "
+                  "Log in with `hf.exe login` or set the `HF_TOKEN` environment variable "
+                  "with a valid Hugging Face token.", file=sys.stderr)
         print("  Check the repo ID is current on huggingface.co — model repo names "
               "change over time and this script's defaults may be stale.", file=sys.stderr)
 

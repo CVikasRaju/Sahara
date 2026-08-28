@@ -39,7 +39,6 @@ def compress_model(input_model_path: str, output_model_path: str):
         model_input=input_model_path,
         model_output=output_model_path,
         weight_type=QuantType.QInt8,
-        optimize_model=True,
     )
     orig = os.path.getsize(input_model_path) / (1024 * 1024)
     quant = os.path.getsize(output_model_path) / (1024 * 1024)
