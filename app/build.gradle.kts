@@ -9,9 +9,7 @@ android {
 
     defaultConfig {
         applicationId = "com.itantra"
-        minSdk = 24        // Android 7.0 — chosen to cover low/mid-range devices in the field,
-                            // per the problem statement's hardware constraint. Raise only if a
-                            // required BLE/WiFi-Direct API genuinely forces it.
+        minSdk = 24
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0-scaffold"
@@ -48,6 +46,11 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    // Prevents Gradle from compressing .onnx and .bin models so Sherpa-ONNX can mmap them directly
+    androidResources {
+        noCompress += listOf("onnx", "bin")
+    }
 }
 
 dependencies {
@@ -62,9 +65,8 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    // Sherpa-ONNX: offline neural inference (VAD, STT, TTS) via ONNX Runtime Mobile.
-    // See docs/ML_PIPELINE.md for model selection and compression pipeline details.
-    implementation("com.github.k2-fsa:sherpa-onnx-android:1.13.6")
+    // Targets the dedicated Android AAR module from JitPack to avoid JVM class duplication
+    implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx:1.13.6")
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")

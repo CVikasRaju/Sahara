@@ -1,16 +1,30 @@
+# Android Studio / IDE
 *.iml
-.gradle
-/local.properties
-/.idea
-.DS_Store
-/build
+.idea/
+local.properties
 /captures
 .externalNativeBuildBluetoothSocket
-.cxx
-local.properties
-# Model weights are large and license-tracked separately — do not commit binaries
+.cxx/
+
+# Build outputs
+.gradle/
+build/
+app/build/
+*.apk
+*.aab
+
+# Python Virtual Environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+# Heavy Neural Models & Raw Weights
 app/src/main/assets/models/**/*.onnx
 app/src/main/assets/models/**/*.bin
 assets/models/
 assets/models_raw/
-app/src/main/assets/models/

@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <color name="ic_launcher_background">#1565C0</color>
-    <color name="ic_launcher_foreground">#FFFFFF</color>
-    <string name="app_name">iTantra</string>
-    <style name="Theme.iTantra" parent="android:Theme.Material.Light.NoActionBar"/>
-</resources>
