@@ -20,9 +20,9 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
-import com.itantra.ml.MockSttEngine
-import com.itantra.ml.MockTtsEngine
-import com.itantra.ml.MockVadEngine
+import com.itantra.ml.SherpaSttEngine
+import com.itantra.ml.SherpaTtsEngine
+import com.itantra.ml.SherpaVadEngine
 import com.itantra.ml.SttEngine
 import com.itantra.ml.TtsEngine
 import com.itantra.ml.VadEngine
@@ -96,11 +96,13 @@ class TransceiverService : Service() {
 
     override fun onBind(intent: Intent?): IBinder = binder
 
-    // ── Engines (swap for Sherpa*Engine once real models are in place) ──────
+    // ── Engines (Sherpa-ONNX backed — see ml/Engines.kt) ─────────────────
+    // Lazy initialization defers native model loading until enableTransceiver()
+    // is called, respecting the RAM footprint budget.
 
-    private val vadEngine: VadEngine = MockVadEngine()
-    private val sttEngine: SttEngine = MockSttEngine()
-    private val ttsEngine: TtsEngine = MockTtsEngine()
+    private val vadEngine: VadEngine by lazy { SherpaVadEngine(this) }
+    private val sttEngine: SttEngine by lazy { SherpaSttEngine(this) }
+    private val ttsEngine: TtsEngine by lazy { SherpaTtsEngine(this) }
     private val messageQueue = MessageQueue()
 
     // ── Bluetooth Transport ────────────────────────────────────────────────
@@ -493,6 +495,8 @@ class TransceiverService : Service() {
         pcmChannel.close()
         sttEngine.unloadCurrentLanguage()
         ttsEngine.unloadCurrentLanguage()
+        // Release VAD native resources (SherpaVadEngine has its own release())
+        (vadEngine as? SherpaVadEngine)?.release()
         serviceScope.cancel()
         super.onDestroy()
     }
