@@ -1,0 +1,4 @@
+huggingface_hub>=0.24.0
+onnx>=1.16.0
+onnxruntime>=1.18.0
+jiwer>=3.0.4

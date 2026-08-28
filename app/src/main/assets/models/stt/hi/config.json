@@ -1,0 +1,31 @@
+{
+  "model_type": "conformer-ctc-rnnt",
+  "task": "automatic-speech-recognition",
+  "languages": [
+    "as",
+    "bn",
+    "brx",
+    "gu",
+    "hi",
+    "kn",
+    "ks",
+    "mr"
+  ],
+  "language_details": "Multi-Indic: Assamese, Bengali, Bodo, Gujarati, Hindi, Kannada, Kashmiri, Marathi",
+  "framework": "sherpa-onnx",
+  "original_framework": "nemo",
+  "original_model": "ai4bharat/indicconformer_stt_hi_hybrid_ctc_rnnt_large",
+  "license": "mit",
+  "sample_rate": 16000,
+  "vocab_size": 5633,
+  "architectures": [
+    "Conformer"
+  ],
+  "quantization": "int8",
+  "model_size_mb": {
+    "full": 470,
+    "int8": 188
+  },
+  "authors": "AI4Bharat",
+  "converter": "ONNX Conversion for Mobile Deployment"
+}

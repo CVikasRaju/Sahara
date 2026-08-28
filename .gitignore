@@ -1,0 +1,37 @@
+# Android Studio / IDE
+*.iml
+.idea/
+local.properties
+/captures
+.externalNativeBuildBluetoothSocket
+.cxx/
+
+# Build outputs
+.gradle/
+build/
+app/build/
+*.apk
+*.aab
+
+# Python Virtual Environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+# Heavy Neural Models & Raw Weights
+app/src/main/assets/models/**/*.onnx
+app/src/main/assets/models/**/*.bin
+assets/models/
+assets/models_raw/
+
+.venv/
+.gradle/
+build/
+app/build/
+.idea/
+local.properties
