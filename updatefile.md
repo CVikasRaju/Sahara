@@ -51,7 +51,7 @@ This file serves as a complete handover document for any developer or AI assista
 ### Phase 3: Sherpa-ONNX ML Engine Integration
 - **Dependency Added**:
   - `settings.gradle.kts`: Added JitPack repository (`https://jitpack.io`) for resolving sherpa-onnx.
-  - `app/build.gradle.kts`: Added `com.github.k2-fsa:sherpa-onnx-android:1.13.6` replacing the previous TODO placeholder.
+  - `app/build.gradle.kts`: Added `com.github.k2-fsa.sherpa-onnx:sherpa-onnx:1.13.6` replacing the previous TODO placeholder.
 - **Real Neural Engine Implementations in `ml/Engines.kt`**:
   - `SherpaVadEngine`: Wraps Silero VAD via sherpa-onnx `Vad` class. Loads `silero_vad.onnx` from assets. Falls back to energy-based detection if model absent.
   - `SherpaSttEngine`: Wraps sherpa-onnx `OfflineRecognizer` with Whisper-style config. Loads language-specific encoder/decoder/tokens from `assets/models/stt/<lang>/`. Includes warm-up inference to avoid first-utterance latency spike. Returns null gracefully if model absent.
