@@ -65,7 +65,8 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    // Targets the dedicated Android AAR module from JitPack to avoid JVM class duplication
+    // Sherpa-ONNX: offline neural inference (VAD, STT, TTS) via ONNX Runtime Mobile.
+    // See docs/ML_PIPELINE.md for model selection and compression pipeline details.
     implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx:1.13.6")
 
     testImplementation("junit:junit:4.13.2")
