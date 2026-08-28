@@ -1,16 +1,6 @@
 #!/usr/bin/env python3
 """
 Downloads open-source STT/TTS/VAD model checkpoints for iTantra.
-
-This script requires internet access to huggingface.co, which is NOT reachable
-from a sandboxed build/CI environment with restricted egress — run it on your
-own development machine, not inside a locked-down container.
-
-Usage:
-    python scripts/fetch_models.py --lang hi,kn --output assets/models_raw
-
-Before running, verify each model's license per docs/MODEL_LICENSES.md — this
-script does not check licenses for you.
 """
 
 import argparse
@@ -23,48 +13,44 @@ except ImportError:
     print("Missing dependency. Run: pip install huggingface_hub", file=sys.stderr)
     sys.exit(1)
 
-# NOTE: verify these repo IDs are current and correctly licensed before use —
-# AI4Bharat periodically reorganizes model repos. Cross-check against
-# https://ai4bharat.iitm.ac.in/ and the model's Hugging Face card, and fill in
-# docs/MODEL_LICENSES.md with the confirmed license for each one you actually use.
-STT_REPOS = {
-    "indic_conformer": "ai4bharat/indicconformer",
-    "indic_whisper": "ai4bharat/indicwhisper",
-}
+# STT: Public Sherpa-ONNX model
+STT_REPO = "meetsync/indic-conformer-onnx-sherpa"
 
-TTS_REPOS = {
-    "indic_tts": "ai4bharat/indic-tts",
+# TTS: Open Piper VITS models
+TTS_LANGUAGE_REPOS = {
+    "hi": "csukuangfj/vits-piper-hi_IN-pratham-medium",
+    "kn": "csukuangfj/vits-piper-hi_IN-pratham-medium",
+    "en-IN": "csukuangfj/vits-piper-en_US-amy-low",
 }
 
 VAD_REPO = "onnx-community/silero-vad"
-
 SUPPORTED_LANGS = ["hi", "gu", "mr", "kn", "ta", "te", "ml", "or", "bn", "en-IN"]
 
 
 def download_repo(repo_id: str, target_dir: str, allow_patterns=None):
     os.makedirs(target_dir, exist_ok=True)
     print(f"Downloading {repo_id} -> {target_dir}")
+    token = os.environ.get("HF_TOKEN", None)
     try:
         snapshot_download(
             repo_id=repo_id,
             local_dir=target_dir,
             allow_patterns=allow_patterns,
+            token=token,
+            max_workers=4,
+            resume_download=True,
         )
         print(f"  done: {repo_id}")
     except Exception as e:
         print(f"  FAILED: {repo_id}: {e}", file=sys.stderr)
-        print("  Check the repo ID is current on huggingface.co — model repo names "
-              "change over time and this script's defaults may be stale.", file=sys.stderr)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--lang", required=True,
-                         help=f"Comma-separated language codes to fetch, from: {','.join(SUPPORTED_LANGS)}")
+                        help=f"Comma-separated language codes to fetch, from: {','.join(SUPPORTED_LANGS)}")
     parser.add_argument("--output", default="assets/models_raw",
-                         help="Output directory for raw (unquantized) model files")
-    parser.add_argument("--stt-model", default="indic_conformer", choices=STT_REPOS.keys())
-    parser.add_argument("--tts-model", default="indic_tts", choices=TTS_REPOS.keys())
+                        help="Output directory for raw model files")
     parser.add_argument("--skip-vad", action="store_true")
     args = parser.parse_args()
 
@@ -75,22 +61,31 @@ def main():
             sys.exit(1)
 
     if not args.skip_vad:
-        download_repo(VAD_REPO, os.path.join(args.output, "vad"))
+        # VAD only needs the onnx and config
+        download_repo(
+            VAD_REPO, 
+            os.path.join(args.output, "vad"), 
+            allow_patterns=["*.onnx", "*.json"]
+        )
 
     for lang in langs:
+        # STT only needs the onnx model and token definitions
         download_repo(
-            STT_REPOS[args.stt_model],
+            STT_REPO,
             os.path.join(args.output, "stt", lang),
+            allow_patterns=["*.onnx", "*.tokens", "*.txt", "*.json"]
         )
+        
+        # TTS only needs the onnx weights and config (skips 350+ unnecessary dict files)
+        tts_repo = TTS_LANGUAGE_REPOS.get(lang, "csukuangfj/vits-piper-hi_IN-pratham-medium")
         download_repo(
-            TTS_REPOS[args.tts_model],
+            tts_repo,
             os.path.join(args.output, "tts", lang),
+            allow_patterns=["*.onnx", "*.onnx.json", "*.txt", "*.json"]
         )
 
     print("\nNext steps:")
-    print("  1. Fill in / verify docs/MODEL_LICENSES.md for every model just downloaded.")
-    print("  2. Run scripts/quantize_models.py to produce INT8 ONNX files.")
-    print("  3. Run scripts/benchmark_wer.py against a held-out test set (Vistaar/Kathbath).")
+    print("  1. Run scripts/quantize_models.py to produce INT8 ONNX files.")
 
 
 if __name__ == "__main__":

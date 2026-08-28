@@ -31,7 +31,6 @@ def compress_model(input_path: str, output_path: str) -> None:
         model_input=input_path,
         model_output=output_path,
         weight_type=QuantType.QInt8,
-        optimize_model=True,
     )
     orig = os.path.getsize(input_path) / (1024 * 1024)
     quant = os.path.getsize(output_path) / (1024 * 1024)
@@ -49,9 +48,9 @@ def find_onnx_files(root: str):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", default="assets/models_raw",
-                         help="Directory of raw FP32 .onnx files (from fetch_models.py)")
+                        help="Directory of raw FP32 .onnx files (from fetch_models.py)")
     parser.add_argument("--output", default="assets/models",
-                         help="Directory to write INT8 quantized models (matches app/src/main/assets/models layout)")
+                        help="Directory to write INT8 quantized models (matches app/src/main/assets/models layout)")
     args = parser.parse_args()
 
     if not os.path.isdir(args.input):
