@@ -26,6 +26,7 @@ Thumbs.db
 # Heavy Neural Models & Raw Weights
 app/src/main/assets/models/**/*.onnx
 app/src/main/assets/models/**/*.bin
+<<<<<<< Updated upstream
 assets/models/
 assets/models_raw/
 
@@ -35,3 +36,6 @@ build/
 app/build/
 .idea/
 local.properties
+=======
+
+>>>>>>> Stashed changes
