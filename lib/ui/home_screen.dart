@@ -11,6 +11,7 @@ import '../state/transceiver_controller.dart';
 import 'widgets/alarm_overlay.dart';
 import 'widgets/pipeline_strip.dart';
 import 'widgets/ptt_button.dart';
+import 'widgets/sos_button.dart';
 
 /// Main transceiver screen — the core UI for iTantra.
 ///
@@ -28,7 +29,7 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   bool _transceiverOn = true;
   bool _permissionsChecked = false;
   final _textController = TextEditingController();
@@ -39,6 +40,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _textController.addListener(() {
       if (mounted) setState(() {});
     });
@@ -61,7 +63,19 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Returning from a settings screen (DND access, battery optimisation):
+    // re-read the native emergency state so the readiness strip updates.
+    if (state == AppLifecycleState.resumed) {
+      final ctrl =
+          Provider.of<TransceiverController>(context, listen: false);
+      ctrl.refreshEmergencyState();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _meshTimer?.cancel();
     _textController.dispose();
     _textFocusNode.dispose();
@@ -416,6 +430,32 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   const SizedBox(height: 8),
 
+                  // ── SOS + Emergency readiness ─────────────────
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Row(
+                      children: [
+                        SosButton(
+                          enabled: _transceiverOn &&
+                              ctrl.phase == TransceiverPhase.idle,
+                          sending: ctrl.sosInFlight,
+                          onSend: (note) => ctrl.sendSos(note: note),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: _EmergencyReadiness(
+                            standbyActive: ctrl.standbyActive,
+                            dndAccess: ctrl.dndAccess,
+                            batteryExempt: ctrl.batteryExempt,
+                            onOpenDnd: ctrl.openDndSettings,
+                            onOpenBattery: ctrl.openBatterySettings,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+
                   // ── Packet Log ────────────────────────────────
                   Expanded(
                     flex: 3,
@@ -427,10 +467,134 @@ class _HomeScreenState extends State<HomeScreen> {
 
             // ── Emergency Alarm Overlay ────────────────────────
             if (ctrl.alarmActive)
-              const AlarmOverlay(),
+              AlarmOverlay(
+                label: ctrl.alarmLabel,
+                text: ctrl.alarmText,
+                sos: ctrl.alarmIsSos,
+                durationSeconds: ctrl.alarmIsSos ? 20 : 9,
+              ),
           ],
         );
       },
+    );
+  }
+}
+
+/// ── Emergency Readiness Strip ─────────────────────────────────
+
+/// Compact row of SOS readiness chips.
+///
+/// Each chip is green when ready and amber-tappable when action is needed:
+/// standby keeps reception alive with the app closed, DND access lets the
+/// spoken message through Do Not Disturb, and battery exemption stops OEM
+/// savers from killing standby.
+class _EmergencyReadiness extends StatelessWidget {
+  const _EmergencyReadiness({
+    required this.standbyActive,
+    required this.dndAccess,
+    required this.batteryExempt,
+    required this.onOpenDnd,
+    required this.onOpenBattery,
+  });
+
+  final bool standbyActive;
+  final bool dndAccess;
+  final bool batteryExempt;
+  final VoidCallback onOpenDnd;
+  final VoidCallback onOpenBattery;
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 6,
+      runSpacing: 4,
+      children: [
+        _ReadinessChip(
+          icon: Icons.notifications_active,
+          label: 'Standby',
+          ready: standbyActive,
+          onTap: standbyActive ? null : onOpenBattery,
+          tooltip: standbyActive
+              ? 'Listening for SOS even when the app is closed'
+              : 'Standby is off — tap to check battery settings',
+        ),
+        _ReadinessChip(
+          icon: Icons.do_not_disturb_off,
+          label: 'DND',
+          ready: dndAccess,
+          onTap: dndAccess ? null : onOpenDnd,
+          tooltip: dndAccess
+              ? 'SOS can lift Do Not Disturb and speak loudly'
+              : 'Tap to grant DND access so SOS can speak through it',
+        ),
+        _ReadinessChip(
+          icon: Icons.battery_saver,
+          label: 'Battery',
+          ready: batteryExempt,
+          onTap: batteryExempt ? null : onOpenBattery,
+          tooltip: batteryExempt
+              ? 'Exempt from battery optimisation'
+              : 'Tap to exempt iTantra from battery optimisation',
+        ),
+      ],
+    );
+  }
+}
+
+class _ReadinessChip extends StatelessWidget {
+  const _ReadinessChip({
+    required this.icon,
+    required this.label,
+    required this.ready,
+    required this.onTap,
+    required this.tooltip,
+  });
+
+  final IconData icon;
+  final String label;
+  final bool ready;
+  final VoidCallback? onTap;
+  final String tooltip;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = ready ? iTantraTheme.success : iTantraTheme.saffron;
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(8),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+          decoration: BoxDecoration(
+            color: color.withValues(alpha: ready ? 0.12 : 0.08),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(
+              color: color.withValues(alpha: ready ? 0.4 : 0.25),
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 12, color: color),
+              const SizedBox(width: 3),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w600,
+                  color: color,
+                ),
+              ),
+              if (!ready) ...[
+                const SizedBox(width: 3),
+                const Icon(Icons.arrow_forward_ios,
+                    size: 8, color: iTantraTheme.textMuted),
+              ],
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

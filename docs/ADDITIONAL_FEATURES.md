@@ -34,6 +34,16 @@ Show the sender the transcribed text with a confidence indicator before it trans
 ### 8. Group / Broadcast Mode
 One-to-many PTT instead of strictly 1:1, closer to how real disaster-response radio channels work (a command post broadcasting to a full team rather than pairing individually).
 
+### 8a. SOS Emergency Broadcast (implemented)
+A red SOS button that fans an emergency alert (Packet Type `0x2`, see NETWORK_PROTOCOL.md §Packet Type) to every device in radio range — not one peer, all of them. Receiving devices treat it as "raise the alarm": a full-screen red overlay, a spoken message via TTS, and a native alert that is engineered to be un-missable:
+
+- **App closed on the receiver** — a foreground standby service (`SosService.kt`) keeps the Flutter engine (and the BLE / Wi-Fi Direct mesh) alive after the app is swiped off the recents list, so the packet is still received. The alarm is raised by the native layer, which works with no Activity attached.
+- **Silent mode / Do Not Disturb** — the alarm tone plays on `STREAM_ALARM` (what silent and DND modes do not silence), the SOS notification channel is created with `setBypassDnd(true)`, and with Notification Policy Access granted the receiver's DND is lifted entirely for the alert and restored after.
+- **Screen off / locked** — the full-screen notification intent wakes the display and shows over the lock screen.
+- **Delivery guarantee** — when no device is in range, the SOS is queued by the store-and-forward layer and re-sent automatically on reconnect.
+
+The sender gets a 3-second confirm countdown (auto-cancel) so a pocket trigger cannot fire an irreversible village-wide alert, plus an optional note that is shown and spoken on every receiver. A readiness strip (Standby / DND / Battery chips) shows exactly what could block reception on this device and deep-links to the fix.
+
 ### 9. Battery/Thermal-Aware Model Scheduling
 Throttle or unload models based on battery level and thermal state, not just RAM. Field phones will be resource-starved in ways a lab-tested phone isn't — this is a footprint-metric point worth documenting even in a minimal implementation.
 

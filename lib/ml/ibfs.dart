@@ -95,6 +95,19 @@ class IbfPacket {
     this.sourceLang,
     this.measuredTransferMs,
   });
+
+  /// Whether this packet is an explicit SOS alert (Packet Type 0x2).
+  ///
+  /// An SOS is deliberately a distinct type, not just a high priority: it must
+  /// raise the alarm on every receiving device even when that device's owner
+  /// is not looking at the app.
+  bool get isSos => type == PacketType.silentSos;
+
+  /// Whether this packet should raise the emergency alarm UI.
+  bool get raisesAlarm => isSos || priority == Priority.emergency;
+
+  /// Short label for the alarm banner and log.
+  String get alertLabel => isSos ? 'SOS' : 'EMERGENCY';
 }
 
 /// Thrown when a received frame fails validation.

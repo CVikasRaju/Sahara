@@ -1,171 +1,94 @@
 package com.example.voice
 
 import android.content.Context
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
-import android.media.AudioManager
+import android.content.Intent
 import android.os.Build
+import android.os.Bundle
+import android.view.WindowManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
-import io.flutter.plugin.common.MethodChannel
+import io.flutter.embedding.engine.FlutterEngineCache
+import io.flutter.embedding.engine.dart.DartExecutor
+import io.flutter.plugins.GeneratedPluginRegistrant
 
+/**
+ * iTantra's single Activity.
+ *
+ * The Activity attaches to a **cached** Flutter engine and refuses to destroy
+ * it with the host. That is what makes "SOS reaches a phone whose app is
+ * closed" work: when the user swipes iTantra off the recents list, the Activity
+ * dies but the Dart isolate keeps running, so the BLE / Wi-Fi Direct mesh stays
+ * up. [SosService] holds the process at foreground priority so Android does not
+ * reclaim it in the meantime.
+ *
+ * All native channels are registered on the engine in
+ * [iTantraChannels.register], before the Dart entrypoint starts, so they are
+ * also available when no Activity is attached.
+ */
 class MainActivity : FlutterActivity() {
-    private val channelName = "itantra/audio_override"
-    private var audioManager: AudioManager? = null
-    private var focusRequest: AudioFocusRequest? = null
 
-    private var wifiDirect: WifiDirectPlugin? = null
+    companion object {
+        /** Intent extra set when an SOS full-screen notification opens us. */
+        const val EXTRA_SOS_ALERT = "itantra_sos_alert"
 
-    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
-        super.configureFlutterEngine(flutterEngine)
-        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-
-        // Second radio: Wi-Fi Direct group formation + TCP frame relay.
-        // Registered before the Dart side asks for it, so `start` never races
-        // the plugin registration.
-        wifiDirect = WifiDirectPlugin(
-            applicationContext,
-            flutterEngine.dartExecutor.binaryMessenger,
-        )
-
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
-            .setMethodCallHandler { call, result ->
-                when (call.method) {
-                    "setMaxVolume" -> {
-                        try {
-                            val am = audioManager
-                            if (am == null) {
-                                result.error("NO_AM", "AudioManager unavailable", null)
-                                return@setMethodCallHandler
-                            }
-                            // Seize transient audio focus so other apps duck.
-                            requestAudioFocus(am)
-                            // Force the media stream to maximum volume.
-                            val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-                            am.setStreamVolume(AudioManager.STREAM_MUSIC, max, 0)
-                            result.success(true)
-                        } catch (e: Exception) {
-                            result.error("ERR", e.message, null)
-                        }
-                    }
-                    "restoreAudio" -> {
-                        try {
-                            abandonAudioFocus()
-                            result.success(true)
-                        } catch (e: Exception) {
-                            result.error("ERR", e.message, null)
-                        }
-                    }
-                    "extractAsset" -> {
-                        val assetPath = call.argument<String>("assetPath")
-                        val destPath = call.argument<String>("destPath")
-                        if (assetPath == null || destPath == null) {
-                            result.error("ARG_ERR", "Missing path arguments", null)
-                            return@setMethodCallHandler
-                        }
-                        Thread {
-                            try {
-                                val destFile = java.io.File(destPath)
-                                val tempFile = java.io.File("$destPath.tmp")
-                                destFile.parentFile?.mkdirs()
-
-                                var copied = false
-                                val flutterAssetPath = if (assetPath.startsWith("flutter_assets/")) assetPath else "flutter_assets/$assetPath"
-
-                                // Attempt 1: Try reading via AssetManager
-                                try {
-                                    assets.open(flutterAssetPath).use { input ->
-                                        java.io.FileOutputStream(tempFile).use { output ->
-                                            val buffer = ByteArray(65536)
-                                            var bytesRead: Int
-                                            while (input.read(buffer).also { bytesRead = it } != -1) {
-                                                output.write(buffer, 0, bytesRead)
-                                            }
-                                            output.flush()
-                                        }
-                                    }
-                                    if (tempFile.length() > 0) copied = true
-                                } catch (_: Exception) {
-                                    // AssetManager could not read or exceeded uncompress limit
-                                }
-
-                                // Attempt 2: If AssetManager failed, stream directly from the APK ZipFile
-                                if (!copied) {
-                                    val apkPath = applicationContext.applicationInfo.sourceDir
-                                    java.util.zip.ZipFile(apkPath).use { zip ->
-                                        val entry = zip.getEntry("assets/$flutterAssetPath")
-                                            ?: zip.getEntry(flutterAssetPath)
-                                            ?: zip.entries().asSequence().firstOrNull { it.name.endsWith(assetPath) }
-
-                                        if (entry != null) {
-                                            zip.getInputStream(entry).use { input ->
-                                                java.io.FileOutputStream(tempFile).use { output ->
-                                                    val buffer = ByteArray(65536)
-                                                    var bytesRead: Int
-                                                    while (input.read(buffer).also { bytesRead = it } != -1) {
-                                                        output.write(buffer, 0, bytesRead)
-                                                    }
-                                                    output.flush()
-                                                }
-                                            }
-                                            if (tempFile.length() > 0) copied = true
-                                        }
-                                    }
-                                }
-
-                                if (copied && tempFile.length() > 0) {
-                                    if (destFile.exists()) destFile.delete()
-                                    tempFile.renameTo(destFile)
-                                    runOnUiThread { result.success(true) }
-                                } else {
-                                    tempFile.delete()
-                                    runOnUiThread { result.error("COPY_ERR", "Could not extract asset: $assetPath", null) }
-                                }
-                            } catch (e: Exception) {
-                                runOnUiThread { result.error("COPY_ERR", e.message, null) }
-                            }
-                        }.start()
-                    }
-                    else -> result.notImplemented()
-                }
-            }
+        /**
+         * Cache key for the shared engine. Scoped to this process, so a fresh
+         * install or process restart starts cleanly.
+         */
+        private const val ENGINE_ID = "itantra_main_engine"
     }
 
-    private fun requestAudioFocus(am: AudioManager) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val attrs = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_MEDIA)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build()
-            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                .setAudioAttributes(attrs)
-                .setWillPauseWhenDucked(false)
-                .build()
-            focusRequest = request
-            am.requestAudioFocus(request)
+    /**
+     * Provide (creating once) the cached engine.
+     *
+     * Registration order matters: plugins and native channels are wired up
+     * *before* the Dart entrypoint runs, so Dart can never observe a missing
+     * platform channel.
+     */
+    override fun provideFlutterEngine(context: Context): FlutterEngine {
+        val cache = FlutterEngineCache.getInstance()
+        cache.get(ENGINE_ID)?.let { return it }
+
+        val engine = FlutterEngine(applicationContext)
+        GeneratedPluginRegistrant.registerWith(engine)
+        iTantraChannels.register(engine, applicationContext)
+        engine.dartExecutor.executeDartEntrypoint(
+            DartExecutor.DartEntrypoint.createDefault(),
+        )
+        cache.put(ENGINE_ID, engine)
+        return engine
+    }
+
+    /**
+     * Keep the engine alive across Activity destruction. This is the whole
+     * mechanism behind receiving SOS signals while the app appears closed.
+     */
+    override fun shouldDestroyEngineWithHost(): Boolean = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        EmergencyAlerts.ensureChannels(applicationContext)
+
+        // When an SOS full-screen notification launches us, make sure the alarm
+        // UI is visible over the lock screen and the display wakes up.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
         } else {
             @Suppress("DEPRECATION")
-            am.requestAudioFocus(
-                null,
-                AudioManager.STREAM_MUSIC,
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON,
             )
         }
     }
 
-    private fun abandonAudioFocus() {
-        val am = audioManager ?: return
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            focusRequest?.let { am.abandonAudioFocusRequest(it) }
-        } else {
-            @Suppress("DEPRECATION")
-            am.abandonAudioFocus(null)
-        }
-    }
+    /** Whether this launch was triggered by an SOS alert. */
+    fun launchedFromSos(): Boolean =
+        intent?.getBooleanExtra(EXTRA_SOS_ALERT, false) == true
 
-    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
-        abandonAudioFocus()
-        wifiDirect = null
-        super.cleanUpFlutterEngine(flutterEngine)
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
     }
 }

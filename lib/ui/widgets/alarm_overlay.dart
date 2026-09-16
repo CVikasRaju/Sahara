@@ -6,13 +6,26 @@ import '../../core/theme.dart';
 /// Full-screen emergency alarm overlay (ARCHITECTURE.md §2.3).
 ///
 /// Non-dismissible — appears on emergency packets, pulses red, forces
-/// screen wake, and auto-clears after [durationSeconds].
+/// screen wake, and auto-clears after [durationSeconds]. The label switches
+/// between SOS and generic EMERGENCY based on how the alert was raised.
 class AlarmOverlay extends StatefulWidget {
   final int durationSeconds;
+
+  /// 'SOS' or 'EMERGENCY' — what the sender transmitted.
+  final String label;
+
+  /// The sender's message, if any.
+  final String? text;
+
+  /// Whether this is an explicit SOS packet (longer alert window).
+  final bool sos;
 
   const AlarmOverlay({
     super.key,
     this.durationSeconds = 9,
+    this.label = 'EMERGENCY',
+    this.text,
+    this.sos = false,
   });
 
   @override
@@ -68,34 +81,64 @@ class _AlarmOverlayState extends State<AlarmOverlay>
                   AnimatedScale(
                     scale: 1.0 + _pulse.value * 0.15,
                     duration: const Duration(milliseconds: 200),
-                    child: const Icon(
-                      Icons.warning_amber_rounded,
+                    child: Icon(
+                      widget.sos ? Icons.sos : Icons.warning_amber_rounded,
                       size: 80,
                       color: Colors.white,
                     ),
                   ),
                   const SizedBox(height: 24),
 
-                  // Title
-                  const Text(
-                    'EMERGENCY',
-                    style: TextStyle(
-                      fontSize: 32,
+                  // Title — 'SOS' for an SOS packet, 'EMERGENCY' otherwise.
+                  Text(
+                    widget.label,
+                    style: const TextStyle(
+                      fontSize: 40,
                       fontWeight: FontWeight.w900,
                       color: Colors.white,
-                      letterSpacing: 6,
+                      letterSpacing: 8,
                     ),
                   ),
                   const SizedBox(height: 12),
 
                   // Subtitle
                   Text(
-                    'SOS signal received',
+                    widget.sos
+                        ? 'Emergency SOS signal received'
+                        : 'Emergency signal received',
                     style: TextStyle(
                       fontSize: 16,
                       color: Colors.white.withValues(alpha: 0.9),
                     ),
                   ),
+
+                  // Sender's message
+                  if (widget.text != null && widget.text!.isNotEmpty) ...[
+                    const SizedBox(height: 20),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 32),
+                      child: Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withValues(alpha: 0.12),
+                          borderRadius: BorderRadius.circular(10),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.3),
+                          ),
+                        ),
+                        child: Text(
+                          widget.text!,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white,
+                            height: 1.4,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
                   const SizedBox(height: 40),
 
                   // Countdown bar
@@ -108,7 +151,8 @@ class _AlarmOverlayState extends State<AlarmOverlay>
                           children: [
                             LinearProgressIndicator(
                               value: 1.0 - _countdown.value,
-                              backgroundColor: Colors.white.withValues(alpha: 0.3),
+                              backgroundColor:
+                                  Colors.white.withValues(alpha: 0.3),
                               valueColor:
                                   const AlwaysStoppedAnimation(Colors.white),
                               minHeight: 6,

@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart' as geo;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../core/emergency_service.dart';
 import '../ml/ibfs.dart';
 import '../ml/languages.dart';
 import '../ml/stt_engine.dart';
@@ -42,6 +43,10 @@ class LogEntry {
   final double? lon;
   final String? error;
 
+  /// Whether this entry is an explicit SOS alert rather than a routine
+  /// emergency-priority message.
+  final bool sos;
+
   const LogEntry({
     required this.id,
     required this.timestamp,
@@ -56,6 +61,7 @@ class LogEntry {
     this.lat,
     this.lon,
     this.error,
+    this.sos = false,
   });
 
   Map<String, dynamic> toJson() => {
@@ -72,6 +78,7 @@ class LogEntry {
         'lat': lat,
         'lon': lon,
         'error': error,
+        'sos': sos,
       };
 
   factory LogEntry.fromJson(Map<String, dynamic> j) => LogEntry(
@@ -91,6 +98,7 @@ class LogEntry {
         lat: (j['lat'] as num?)?.toDouble(),
         lon: (j['lon'] as num?)?.toDouble(),
         error: j['error'] as String?,
+        sos: j['sos'] as bool? ?? false,
       );
 }
 
@@ -149,6 +157,11 @@ class TransceiverController extends ChangeNotifier {
     _meshActive = ok;
     if (!ok) _statusMessage = t.stats.failureHint ?? _statusMessage;
     notifyListeners();
+
+    // Standby keeps this isolate alive with no Activity attached, which is what
+    // lets an SOS arrive when the app looks closed. Started regardless of the
+    // radio result: it also keeps the radio retry loop running.
+    await enableStandby();
   }
 
   /// Live radio state (BLE + Wi-Fi Direct), for the app-bar badge.
@@ -237,6 +250,27 @@ class TransceiverController extends ChangeNotifier {
 
   Priority _alarmPriority = Priority.emergency;
   Priority get alarmPriority => _alarmPriority;
+
+  /// Text of the message that raised the current alarm.
+  String? _alarmText;
+  String? get alarmText => _alarmText;
+
+  /// 'SOS' or 'EMERGENCY' — shown in the alarm banner.
+  String _alarmLabel = 'EMERGENCY';
+  String get alarmLabel => _alarmLabel;
+
+  /// Whether the current alarm came from an explicit SOS packet.
+  bool _alarmIsSos = false;
+  bool get alarmIsSos => _alarmIsSos;
+
+  /// When the current alarm started, used to ignore stale auto-clear timers
+  /// when a second alert arrives while one is already showing.
+  DateTime? _alarmStartedAt;
+  Timer? _alarmTimer;
+
+  /// Number of devices the last SOS was handed to.
+  int _lastSosFanout = 0;
+  int get lastSosFanout => _lastSosFanout;
 
   final List<LogEntry> _log = [];
   List<LogEntry> get log => List.unmodifiable(_log);
@@ -524,20 +558,7 @@ class TransceiverController extends ChangeNotifier {
     final priority = isDistress ? Priority.emergency : Priority.routine;
 
     // ── GPS stamping (ADDITIONAL_FEATURES.md §2) ──
-    double? lat;
-    double? lon;
-    if (_gpsEnabled) {
-      try {
-        final pos = await geo.Geolocator.getCurrentPosition(
-          desiredAccuracy: geo.LocationAccuracy.low,
-          timeLimit: const Duration(seconds: 5),
-        );
-        lat = pos.latitude;
-        lon = pos.longitude;
-      } catch (_) {
-        // GPS unavailable — continue without it.
-      }
-    }
+    final (lat, lon) = await _stampGps();
 
     // ── Encode ──
     _sequenceId++;
@@ -610,6 +631,212 @@ class TransceiverController extends ChangeNotifier {
     _phase = TransceiverPhase.idle;
     _interimText = '';
     notifyListeners();
+  }
+
+  /// Best-effort GPS fix for an outgoing frame.
+  ///
+  /// Never throws and never blocks for long: an SOS must not wait on a
+  /// satellite, and a missing fix is better than a late alert.
+  Future<(double?, double?)> _stampGps({
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
+    if (!_gpsEnabled) return (null, null);
+    try {
+      final pos = await geo.Geolocator.getCurrentPosition(
+        desiredAccuracy: geo.LocationAccuracy.low,
+        timeLimit: timeout,
+      );
+      return (pos.latitude, pos.longitude);
+    } catch (_) {
+      return (null, null);
+    }
+  }
+
+  // ── SOS + Emergency Standby ────────────────────────────────────
+
+  bool _standbyActive = false;
+
+  /// Whether Android is keeping iTantra alive in the background, so SOS
+  /// signals are received even with the app swiped off the recents list.
+  bool get standbyActive => _standbyActive;
+
+  bool _dndAccess = false;
+
+  /// Whether the user granted Do Not Disturb access.
+  ///
+  /// The alarm tone is exempt from DND either way; this access is what also
+  /// lifts DND so the *spoken* message is audible.
+  bool get dndAccess => _dndAccess;
+
+  bool _batteryExempt = true;
+
+  /// Whether the app is exempt from battery optimisation. Without it, OEM
+  /// battery savers can kill standby and with it SOS reception.
+  bool get batteryExempt => _batteryExempt;
+
+  bool _sosInFlight = false;
+  bool get sosInFlight => _sosInFlight;
+
+  DateTime? _lastSosSentAt;
+  DateTime? get lastSosSentAt => _lastSosSentAt;
+
+  /// Re-read native emergency state (called when the app resumes, so status
+  /// updates after the user returns from a settings screen).
+  Future<void> refreshEmergencyState() async {
+    final standby = await EmergencyService.isStandbyRunning();
+    final dnd = await EmergencyService.hasDndAccess();
+    final battery = await EmergencyService.isIgnoringBatteryOptimizations();
+    if (standby == _standbyActive &&
+        dnd == _dndAccess &&
+        battery == _batteryExempt) {
+      return;
+    }
+    _standbyActive = standby;
+    _dndAccess = dnd;
+    _batteryExempt = battery;
+    notifyListeners();
+  }
+
+  /// Turn on background standby. Returns `true` when active.
+  Future<bool> enableStandby() async {
+    final ok = await EmergencyService.startStandby();
+    if (ok != _standbyActive) {
+      _standbyActive = ok;
+      notifyListeners();
+    }
+    return ok;
+  }
+
+  Future<void> disableStandby() async {
+    await EmergencyService.stopStandby();
+    _standbyActive = false;
+    notifyListeners();
+  }
+
+  Future<void> openDndSettings() => EmergencyService.openDndSettings();
+
+  Future<void> openBatterySettings() => EmergencyService.openBatterySettings();
+
+  /// Broadcast an SOS to every nearby device.
+  ///
+  /// This is deliberately not a priority flag on a normal message: an SOS is
+  /// [PacketType.silentSos], which every receiver treats as "raise the alarm",
+  /// including receivers whose app is not on screen.
+  ///
+  /// Returns `true` when at least one device was reached. When nothing is in
+  /// range the frame is queued and re-sent automatically on reconnect.
+  Future<bool> sendSos({String? note}) async {
+    if (_sosInFlight) return false;
+    _sosInFlight = true;
+    notifyListeners();
+
+    try {
+      // Shorter GPS budget than a normal message: alert first, locate second.
+      final (lat, lon) = await _stampGps(
+        timeout: const Duration(seconds: 3),
+      );
+
+      _sequenceId++;
+      final text = (note == null || note.trim().isEmpty)
+          ? 'SOS'
+          : 'SOS — ${note.trim()}';
+
+      final packet = IbfPacket(
+        type: PacketType.silentSos,
+        priority: Priority.emergency,
+        language: _senderLang,
+        sequenceId: _sequenceId,
+        text: text,
+        flags: PayloadFlags(hasGps: lat != null && lon != null),
+        latitude: lat,
+        longitude: lon,
+      );
+      final frame = encodeIbfs(packet);
+
+      int fanout;
+      try {
+        fanout = await transport.send(frame);
+      } catch (e) {
+        final reason = e is StateError ? e.message : e.toString();
+        storeForward.enqueue(frame, sequenceId: _sequenceId);
+        _lastSosFanout = 0;
+        _lastSosSentAt = DateTime.now();
+        _statusMessage = 'SOS queued — $reason. It will be sent automatically '
+            'as soon as a device is in range.';
+        _addLog(LogEntry(
+          id: _sequenceId,
+          timestamp: DateTime.now(),
+          isSent: true,
+          text: text,
+          langName: _senderLang.name,
+          priority: Priority.emergency,
+          lat: lat,
+          lon: lon,
+          sos: true,
+          error: 'Not delivered — $reason\nQueued '
+              '(${storeForward.pendingCount}) for automatic retry',
+        ));
+        return false;
+      }
+
+      _lastSosFanout = fanout;
+      _lastSosSentAt = DateTime.now();
+      _statusMessage = fanout == 1
+          ? 'SOS sent to 1 device'
+          : 'SOS sent to $fanout devices';
+      _addLog(LogEntry(
+        id: _sequenceId,
+        timestamp: DateTime.now(),
+        isSent: true,
+        text: text,
+        langName: _senderLang.name,
+        priority: Priority.emergency,
+        lat: lat,
+        lon: lon,
+        sos: true,
+      ));
+      return fanout > 0;
+    } finally {
+      _sosInFlight = false;
+      notifyListeners();
+    }
+  }
+
+  /// Raise the alarm overlay and the native loud alert.
+  ///
+  /// Not awaited by the inbound path: the alarm must never block the next
+  /// packet from being processed, and a second SOS arriving during an alert
+  /// extends it rather than being dropped.
+  void _raiseAlarm(IbfPacket packet, String displayText) {
+    final startedAt = DateTime.now();
+    _alarmStartedAt = startedAt;
+    _alarmActive = true;
+    _alarmPriority = packet.priority;
+    _alarmIsSos = packet.isSos;
+    _alarmLabel = packet.alertLabel;
+    _alarmText = displayText;
+    notifyListeners();
+
+    // Native alert first: a loud alarm on the alarm stream, a repeating
+    // vibration and a full-screen notification. This is what makes the SOS
+    // audible when no widget tree is mounted, on silent mode, and through
+    // Do Not Disturb.
+    unawaited(EmergencyService.raiseAlarm(
+      text: displayText,
+      from: packet.alertLabel,
+    ));
+
+    _alarmTimer?.cancel();
+    _alarmTimer = Timer(
+      packet.isSos ? const Duration(seconds: 20) : const Duration(seconds: 9),
+      () {
+        // Ignore a stale timer if a newer alert replaced this one.
+        if (_alarmStartedAt != startedAt) return;
+        _alarmActive = false;
+        notifyListeners();
+        unawaited(EmergencyService.clearAlarm());
+      },
+    );
   }
 
   // ── Receive Path ───────────────────────────────────────────────
@@ -687,9 +914,14 @@ class TransceiverController extends ChangeNotifier {
       // Received while we were on air — show it, stay silent.
       ttsMs = null;
     } else {
+      // For an SOS, let the alarm tone land first: the burst grabs attention
+      // and the spoken message then gets through the gaps.
+      if (packet.isSos) {
+        await Future<void>.delayed(const Duration(milliseconds: 1500));
+      }
       final ttsStart = DateTime.now().millisecondsSinceEpoch;
       await tts.speak(spokenText,
-          lang: ttsLang, emergency: packet.priority == Priority.emergency);
+          lang: ttsLang, emergency: packet.raisesAlarm);
       ttsMs = DateTime.now().millisecondsSinceEpoch - ttsStart;
     }
 
@@ -700,31 +932,33 @@ class TransceiverController extends ChangeNotifier {
       timestamp: DateTime.now(),
       isSent: false,
       text: displayText,
-      langName: sameLang ? packet.language.name : '${packet.language.name} → ${_receiverLang.name}',
+      langName: sameLang
+          ? packet.language.name
+          : '${packet.language.name} → ${_receiverLang.name}',
       priority: packet.priority,
       ttsMs: ttsMs,
       e2eMs: e2eMs,
       lat: packet.latitude,
       lon: packet.longitude,
+      sos: packet.isSos,
     ));
 
     // ── Emergency alarm override (ARCHITECTURE.md §2.3) ──
-    if (packet.priority == Priority.emergency) {
-      _alarmActive = true;
-      _alarmPriority = Priority.emergency;
-      notifyListeners();
-
-      // Auto-dismiss after 9 seconds.
-      await Future.delayed(const Duration(seconds: 9));
-      _alarmActive = false;
-      notifyListeners();
+    // Fired last and never awaited, so the alert cannot stall the receive
+    // path for the next packet.
+    if (packet.raisesAlarm) {
+      _raiseAlarm(packet, displayText);
     }
   }
 
-  /// Manually dismiss the alarm.
+  /// Manually dismiss the alarm (also silences the native alert).
   void dismissAlarm() {
+    _alarmTimer?.cancel();
+    _alarmTimer = null;
     _alarmActive = false;
+    _alarmText = null;
     notifyListeners();
+    unawaited(EmergencyService.clearAlarm());
   }
 
   // ── Log persistence ────────────────────────────────────────────
@@ -781,6 +1015,7 @@ class TransceiverController extends ChangeNotifier {
   @override
   void dispose() {
     _linkSubscription?.cancel();
+    _alarmTimer?.cancel();
     transport.disconnect();
     stt.dispose();
     tts.dispose();
