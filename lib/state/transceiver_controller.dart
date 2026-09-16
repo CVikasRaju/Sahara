@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart' as geo;
@@ -212,7 +213,16 @@ class TransceiverController extends ChangeNotifier {
     notifyListeners();
   }
 
-  int _sequenceId = 0;
+  /// Per-launch random prefix for the sequence ID.
+  ///
+  /// The Sequence ID is the *only* identity an iBFS frame carries, and it is
+  /// also the mesh dedup key (NETWORK_PROTOCOL.md §5). If two devices both
+  /// counted up from 1 they would each treat the other's first packets as
+  /// already-seen duplicates and silently drop them. Seeding the high 16 bits
+  /// from a random value keeps concurrent senders apart without changing the
+  /// wire format.
+  final Random _rng = Random();
+  late int _sequenceId = _rng.nextInt(0x10000) << 16;
 
   /// Typed text to send (fallback when STT is unavailable).
   String _typedText = '';
