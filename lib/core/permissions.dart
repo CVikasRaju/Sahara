@@ -28,6 +28,11 @@ class PermissionManager {
     // cause of the 'Bluetooth unavailable' error.
     results['bluetooth'] = await _requestBluetooth();
 
+    // Wi-Fi Direct — the second radio. Android 13+ needs NEARBY_WIFI_DEVICES;
+    // Android 12 and below reuse the location permission already requested
+    // above. Not fatal: the BLE mesh carries traffic on its own.
+    results['wifiDirect'] = await _requestWifiDirect();
+
     return PermissionResult(results);
   }
 
@@ -63,6 +68,19 @@ class PermissionManager {
     }
   }
 
+  static Future<bool> _requestWifiDirect() async {
+    try {
+      if (!Platform.isAndroid) return true;
+      // Android 13+ only; on older versions the permission is mapped to the
+      // location grant we already have, and permission_handler returns the
+      // current status rather than prompting.
+      final status = await Permission.nearbyWifiDevices.request();
+      return status.isGranted || status.isLimited;
+    } catch (_) {
+      return false;
+    }
+  }
+
   static Future<bool> _requestBluetooth() async {
     try {
       if (Platform.isAndroid) {
@@ -91,6 +109,7 @@ class PermissionResult {
   bool get microphoneGranted => results['microphone'] ?? false;
   bool get locationGranted => results['location'] ?? false;
   bool get bluetoothGranted => results['bluetooth'] ?? false;
+  bool get wifiDirectGranted => results['wifiDirect'] ?? false;
 
   bool get allGranted =>
       microphoneGranted && locationGranted && bluetoothGranted;

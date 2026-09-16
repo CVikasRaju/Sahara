@@ -70,3 +70,72 @@ This keeps the common case (plain text, no extras) at zero overhead beyond the f
 | iTantra text packet + GPS + source-lang flag | ~55-95 bytes |
 
 The original draft's claim of "38 bytes in <5ms" for transfer over RFCOMM is plausible for the raw radio hop alone — but don't present that figure as your *total* system latency; it excludes STT inference, TTS inference, and connection handshake time. State it explicitly as "network transfer only" wherever you cite it, to avoid a judge catching the discrepancy against your end-to-end latency claim.
+
+## 7. Transport Implementation (as built)
+
+Two radios run at once and both carry the same iBFS frames. Neither requires a hotspot,
+a router, an internet connection, or user-visible pairing.
+
+### 7.1 BLE GATT mesh (`lib/net/ble_transport.dart`)
+
+Every device runs **both** GATT roles simultaneously, so there is no host/client split
+and PTT works symmetrically in both directions:
+
+- **Peripheral role** — advertises the iTantra service UUID and serves the frame
+  characteristic.
+- **Central role** — scans (rotating the scan session every 15 s, because Android
+  silently stops delivering results), connects to nodes advertising the service, and
+  subscribes to notifications.
+- **Flooding relay** — a received frame is relayed once to every other peer, deduped by
+  Sequence ID, so a 2+ node cluster extends range without a routing table.
+- **Reconnect retries** — peers seen in an advertisement are remembered and re-connected
+  with backoff, instead of waiting for Android to re-report a cached scan result.
+
+### 7.2 BLE link-layer fragmentation (fixes CRC mismatch corruption)
+
+An iBFS frame is up to 524 bytes; one ATT write/notify carries 20–512 bytes depending on
+negotiated MTU. A frame therefore travels as several chunks:
+
+```
+Byte 0:     0xB5                     chunk magic (never 0x49 'I', so it cannot be
+                                     confused with a complete iBFS frame)
+Byte 1-2:   Fragment ID (uint16 BE)   one per outbound frame
+Byte 3:     Chunk index (0-based)
+Byte 4:     Chunk count
+Byte 5..:   Chunk data
+```
+
+Receive order matters and is now enforced: **reassemble → validate magic → dedup by
+Sequence ID → deliver once → relay**. Feeding individual ATT chunks straight to
+`decodeIbfs()` was previously producing `CRC mismatch: expected 0x3680, computed 0x4e98`
+for every frame larger than one ATT payload. Chunk sizes come from
+`getMaximumWriteLength()` / `getMaximumNotifyLength()`, so notifications are never
+silently truncated by the OS stack.
+
+### 7.3 Wi-Fi Direct (`android/app/src/main/kotlin/com/example/voice/WifiDirectPlugin.kt`)
+
+Adds range and bandwidth as a second, independent radio:
+
+- Both devices call `discoverPeers()`; group formation is left to Wi-Fi Direct's own
+  owner negotiation, biased deterministically by device address when the OS exposes it.
+- The group owner opens a TCP server on port 8988; clients connect to the owner's P2P
+  address. Frames are length-prefixed (`int32` big-endian + payload) and relayed by the
+  owner to all other members.
+- An owner whose group nobody joins gives the group up after 25 s, so two phones can
+  never get stuck in two separate one-member groups.
+
+### 7.4 Aggregation and dedup (`lib/net/mesh_transport.dart`)
+
+The two radios are aggregated behind one `Transport`. Frames are sent on every live
+radio, and inbound traffic is deduplicated on `(Sequence ID)` *across* radios, so a
+packet that arrives over both BLE and Wi-Fi Direct is decoded and spoken exactly once.
+
+Bluetooth starts first; Wi-Fi Direct joins after 12 s if Bluetooth is still up but
+peerless (this is precisely the case where an active Wi-Fi link is starving BLE
+discovery), or immediately if Bluetooth could not start at all. If no peer is reachable,
+`send()` fails and the frame is queued for store-and-forward instead of being dropped
+silently.
+
+Half-duplex discipline: while a device is recording, processing or transmitting, an
+inbound frame is logged but not spoken, so the receiver's speaker cannot be picked up by
+its own microphone and re-transmitted.

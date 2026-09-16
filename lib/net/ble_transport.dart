@@ -3,14 +3,30 @@ import 'dart:async';
 import 'package:bluetooth_low_energy/bluetooth_low_energy.dart';
 import 'package:flutter/foundation.dart';
 
-/// BLE GATT mesh transport (NETWORK_PROTOCOL.md §2 transport stage).
+import 'fragmentation.dart';
+
+/// BLE GATT mesh transport (NETWORK_PROTOCOL.md §2).
 ///
-/// Every device runs BOTH roles simultaneously:
-///  - Peripheral: advertises the iTantra service and accepts writes.
-///  - Central: scans for other iTantra peripherals, connects, subscribes.
+/// Every device runs BOTH roles at the same time:
+///  - Peripheral: advertises the iTantra service and accepts writes/notifies.
+///  - Central: scans for other iTantra nodes, connects and subscribes.
 ///
-/// A frame received from any peer is delivered to the app once (dedup by
-/// sequence ID) and re-broadcast to all OTHER peers — flooding relay.
+/// Because both roles are always active there is no host/client split, so
+/// PTT works in both directions, with no pairing and no hotspot. A GATT
+/// connection is not a bond — Android never shows a pairing dialog.
+///
+/// Three failure modes that used to break field use are handled here:
+///
+///  1. **Frame corruption.** Frames larger than one ATT payload are split into
+///     [FrameSplitter] chunks and rebuilt by [FrameReassembler] before reaching
+///     the iBFS decoder. Feeding raw chunks to the decoder was the cause of
+///     `[Corrupt frame dropped] IbfDecodeError: CRC mismatch`.
+///  2. **Dead scan sessions.** Android silently stops delivering scan results
+///     after a while (and deprioritises BLE while Wi-Fi is busy), which made the
+///     peer count stick at "offline". The scan session is rotated on a timer.
+///  3. **Lost links that never re-form.** Peers seen in advertisements are
+///     remembered and re-connected with backoff instead of waiting for Android
+///     to re-report them (it caches scan results).
 class BleMeshTransport {
   BleMeshTransport._();
 
@@ -22,32 +38,67 @@ class BleMeshTransport {
   static final UUID frameCharUuid =
       UUID.fromString('8f1d3a50-6f2c-4c1e-9b7a-5a2e9d0c1a11');
 
+  /// Locally generated frame IDs are cached this long for deduplication.
+  static const int _dedupTtlMs = 120000;
+
+  /// Rotate the scan session this often (Android scan results go stale).
+  static const int _scanRotateMs = 15000;
+
+  /// Retry known-but-disconnected peers on this cadence.
+  static const int _retryMs = 6000;
+
+  /// Forget a peer that has not advertised for this long.
+  static const int _peerTtlMs = 90000;
+
+  /// Concurrent GATT connections are capped — Android stacks typically start
+  /// failing with status 133 beyond ~4–7, and each one costs radio airtime.
+  static const int _maxPeers = 4;
+
+  /// iBFS magic bytes, used to reject non-protocol payloads.
+  static const int _ibfsMagic0 = 0x49; // 'I'
+  static const int _ibfsMagic1 = 0x54; // 'T'
+
   final PeripheralManager _peripheral = PeripheralManager();
   final CentralManager _central = CentralManager();
 
   final _controller = StreamController<Uint8List>.broadcast();
-  final Map<UUID, Peripheral> _connected = {};
-  final Map<UUID, GATTCharacteristic> _peerFrameChars = {};
-  final Set<Central> _subscribedCentrals = {};
 
-  /// Dedup cache: sequence ID → arrival ms. Frames are identified by the
-  /// uint32 sequence ID (iBFS bytes 4–7); each ID is processed once.
+  /// Peers we hold a GATT connection to (we are the central).
+  final Map<String, Peripheral> _connected = {};
+  final Map<String, GATTCharacteristic> _peerChars = {};
+  final Map<String, int> _peerWritePayload = {};
+
+  /// Centrals connected to us (we are the peripheral).
+  final Map<String, Central> _subscribedCentrals = {};
+  final Map<String, int> _notifyPayload = {};
+
+  /// Peers seen advertising the iTantra service, for reconnect retries.
+  final Map<String, _PeerRecord> _knownPeers = {};
+
+  /// In-flight connection attempts, keyed by peer.
+  final Set<String> _connecting = {};
+
+  /// Peers whose GATT discovery/subscribe is in progress.
+  final Set<String> _subscribing = {};
+
+  /// Dedup cache: iBFS sequence ID → arrival ms.
   final Map<int, int> _seenIds = {};
+
+  final FrameSplitter _splitter = FrameSplitter();
+  final FrameReassembler _reassembler = FrameReassembler();
 
   GATTCharacteristic? _frameChar;
   bool _running = false;
+  bool _scanning = false;
+  Timer? _scanTimer;
+  Timer? _retryTimer;
+
   StreamSubscription? _subDiscovered;
-  StreamSubscription? _subConn;
+  StreamSubscription? _subCentralConn;
   StreamSubscription? _subNotified;
   StreamSubscription? _subWrite;
   StreamSubscription? _subNotifyState;
-
-  /// Per-peer negotiated MTU (keyed by peripheral UUID).
-  /// Defaults to 20 (minimum BLE ATT payload) before negotiation completes.
-  final Map<UUID, int> _peerMtu = {};
-
-  /// In-flight connection attempts to avoid GATT 133 collision storms.
-  final Set<UUID> _connecting = {};
+  StreamSubscription? _subPeripheralConn;
 
   /// Inbound (and relayed) iBFS frames from the mesh.
   Stream<Uint8List> get incoming => _controller.stream;
@@ -55,24 +106,47 @@ class BleMeshTransport {
   /// Whether the BLE mesh is currently running.
   bool get isRunning => _running;
 
-  /// Number of currently connected mesh peers.
-  int get peerCount => _connected.length;
+  /// Number of peers we can currently exchange frames with.
+  int get peerCount => _connected.length + _subscribedCentrals.length;
+
+  /// Number of nodes recently seen advertising, connected or not.
+  int get knownPeerCount =>
+      _knownPeers.length + _connected.length + _subscribedCentrals.length;
+
+  /// Whether the central-role scan session is active.
+  bool get isScanning => _scanning;
+
+  /// Why the last start attempt failed, if it did. Surfaced in the UI so
+  /// "offline" is never a dead end.
+  String? get lastError => _lastError;
+  String? _lastError;
+
+  /// Human-readable link state for the UI.
+  String get status {
+    if (!_running) return 'off';
+    final peers = peerCount;
+    if (peers > 0) return '$peers peer${peers == 1 ? '' : 's'}';
+    return _scanning ? 'scanning' : 'idle';
+  }
+
+  static String _key(UUID uuid) => uuid.value.join(',');
 
   /// Start advertising + scanning.
   ///
-  /// IMPORTANT ordering (this was the 'Bluetooth unavailable' bug):
-  /// 1. `authorize()` — shows the Android runtime permission dialog and
-  ///    must run BEFORE any state check. The state is reported as
-  ///    `unauthorized` until the user grants the BT permissions, so a
-  ///    naive `state != poweredOn → return false` always failed here.
+  /// Ordering matters (this was the 'Bluetooth unavailable' bug):
+  /// 1. `authorize()` shows the Android runtime permission dialog and must run
+  ///    BEFORE any state check — the state reads `unauthorized` until the user
+  ///    grants the Bluetooth permissions, so a naive
+  ///    `state != poweredOn → return false` always failed here.
   /// 2. Wait (briefly) for the state stream to settle at `poweredOn`.
-  /// 3. Only then set up GATT + advertising + discovery.
+  /// 3. Only then publish the GATT service, advertise, and scan.
   Future<bool> start() async {
     if (_running) return true;
     try {
       // ── Step 1: request permissions (both roles) ──
       final centralOk = await _central.authorize();
       if (!centralOk) {
+        _lastError = 'Bluetooth permission denied';
         debugPrint('BleMesh: central authorize denied');
         return false;
       }
@@ -84,6 +158,7 @@ class BleMeshTransport {
 
       // ── Step 2: wait for the radio to be powered on ──
       if (!await _waitForPoweredOn()) return false;
+      _lastError = null;
 
       // ── Step 3: peripheral role — publish service & advertise ──
       _frameChar = GATTCharacteristic.mutable(
@@ -108,7 +183,6 @@ class BleMeshTransport {
       );
       await _peripheral.addService(service);
 
-      // Start advertising as an iTantra node.
       await _peripheral.startAdvertising(Advertisement(
         name: 'iTantra',
         serviceUUIDs: [serviceUuid],
@@ -116,29 +190,37 @@ class BleMeshTransport {
 
       // ── Event wiring ──
       _subDiscovered = _central.discovered.listen(_onDiscovered);
-      _subConn = _central.connectionStateChanged.listen(_onCentralConnChanged);
+      _subCentralConn =
+          _central.connectionStateChanged.listen(_onCentralConnChanged);
       _subNotified = _central.characteristicNotified.listen(_onNotified);
       _subWrite =
           _peripheral.characteristicWriteRequested.listen(_onWriteRequested);
+      _subPeripheralConn = _peripheral.connectionStateChanged
+          .listen(_onPeripheralConnChanged);
       _subNotifyState =
-          _peripheral.characteristicNotifyStateChanged.listen((args) {
-        if (args.characteristic.uuid != frameCharUuid) return;
-        if (args.state) {
-          _subscribedCentrals.add(args.central);
-        } else {
-          _subscribedCentrals.remove(args.central);
-        }
-      });
+          _peripheral.characteristicNotifyStateChanged.listen(_onNotifyState);
 
-      // ── Central role: scan for all nearby devices and filter in software ──
-      // Hardware 128-bit UUID filtering is notoriously dropped by Android OEM BLE drivers.
-      // Software filtering in _onDiscovered guarantees 100% detection rate.
-      await _central.startDiscovery();
+      // ── Central role: scan without a hardware UUID filter ──
+      // Hardware 128-bit UUID filtering is dropped by several Android BLE
+      // drivers, so discovery is unfiltered and filtered in software in
+      // _onDiscovered. Advertising still carries the service UUID, so peers
+      // can identify us.
+      await _startScan();
+
+      _scanTimer = Timer.periodic(
+        const Duration(milliseconds: _scanRotateMs),
+        (_) => _rotateScan(),
+      );
+      _retryTimer = Timer.periodic(
+        const Duration(milliseconds: _retryMs),
+        (_) => _retryPeers(),
+      );
 
       _running = true;
       debugPrint('BleMesh: started (advertising + scanning)');
       return true;
     } catch (e) {
+      _lastError = e.toString();
       debugPrint('BleMeshTransport.start failed: $e');
       await stop();
       return false;
@@ -148,8 +230,6 @@ class BleMeshTransport {
   /// Poll the state (refreshes it on Android) and wait up to ~4 s for
   /// `poweredOn`. Fails fast with a precise reason on other states.
   Future<bool> _waitForPoweredOn() async {
-    // Nudge the state machine: getState() is also refreshed on resume by
-    // the package, but polling makes it deterministic here.
     const maxWaits = 8; // 8 × 500 ms = 4 s
     for (var i = 0; i < maxWaits; i++) {
       final state = _central.state;
@@ -157,12 +237,15 @@ class BleMeshTransport {
         case BluetoothLowEnergyState.poweredOn:
           return true;
         case BluetoothLowEnergyState.unsupported:
+          _lastError = 'This device has no Bluetooth LE radio';
           debugPrint('BleMesh: BLE unsupported on this device');
           return false;
         case BluetoothLowEnergyState.unauthorized:
+          _lastError = 'Bluetooth permission not granted';
           debugPrint('BleMesh: Bluetooth permissions not granted');
           return false;
         case BluetoothLowEnergyState.poweredOff:
+          _lastError = 'Bluetooth is switched off — turn it on';
           debugPrint('BleMesh: Bluetooth is powered off');
           return false;
         case BluetoothLowEnergyState.unknown:
@@ -170,244 +253,347 @@ class BleMeshTransport {
           await Future<void>.delayed(const Duration(milliseconds: 500));
       }
     }
-    debugPrint('BleMesh: Bluetooth state did not settle (still unknown)');
+    _lastError = 'Bluetooth did not become ready — check it is switched on';
+    debugPrint('BleMesh: Bluetooth state did not settle');
     return false;
   }
 
-  /// Send an iBFS frame: write to every connected peer (they relay) and
-  /// notify directly-subscribed centrals.
+  Future<void> _startScan() async {
+    try {
+      await _central.startDiscovery();
+      _scanning = true;
+    } catch (e) {
+      _scanning = false;
+      debugPrint('BleMesh: startDiscovery failed: $e');
+    }
+  }
+
+  /// Android scan sessions stop delivering results after a while (and Wi-Fi
+  /// activity can starve them), so the session is restarted periodically.
+  /// Connections are left untouched — only the scan is cycled.
+  Future<void> _rotateScan() async {
+    if (!_running) return;
+    // Enough peers for the relay to be healthy; don't churn the radio.
+    if (peerCount >= _maxPeers) return;
+    try {
+      await _central.stopDiscovery();
+    } catch (_) {}
+    _scanning = false;
+    await Future<void>.delayed(const Duration(milliseconds: 350));
+    if (!_running) return;
+    await _startScan();
+    // Force a fresh attempt at any peer that is known but not connected.
+    _retryPeers();
+  }
+
+  /// Reconnect peers we have seen advertising but are not connected to.
+  void _retryPeers() {
+    if (!_running) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    _knownPeers.removeWhere((_, r) => now - r.lastSeenMs > _peerTtlMs);
+    if (_connecting.length + _connected.length >= _maxPeers) return;
+
+    for (final record in _knownPeers.values.toList()) {
+      final key = record.key;
+      if (_connected.containsKey(key) || _connecting.contains(key)) continue;
+      if (now - record.lastAttemptMs < _retryMs) continue;
+      record.lastAttemptMs = now;
+      _connectTo(record.peripheral, key);
+    }
+  }
+
+  /// Send an iBFS frame: write to every connected peer (they relay) and notify
+  /// directly-subscribed centrals.
   ///
-  /// [excludePeripheral] / [excludeCentral] are used by the relay path so a
-  /// frame is never echoed back to the peer it came from.
-  ///
-  /// Large frames are automatically chunked to respect each peer's negotiated
-  /// ATT MTU (default 20 bytes if negotiation has not yet completed).
+  /// [excludePeer] / [excludeCentral] are used by the relay path so a frame is
+  /// never echoed back to the peer it came from.
   Future<int> send(
     Uint8List frame, {
-    Peripheral? excludePeripheral,
-    Central? excludeCentral,
+    String? excludePeer,
+    String? excludeCentral,
   }) async {
     if (!_running) throw StateError('BLE mesh not started');
     var fanout = 0;
 
-    // Write to other peripherals we are connected to as central.
-    for (final entry in _connected.entries) {
-      if (excludePeripheral != null && entry.key == excludePeripheral.uuid) {
-        continue;
-      }
-      final char = _peerFrameChars[entry.key];
+    // ── Central role: write to the peripherals we are connected to ──
+    for (final entry in List.of(_connected.entries)) {
+      if (excludePeer != null && entry.key == excludePeer) continue;
+      final char = _peerChars[entry.key];
       if (char == null) continue;
-      // ATT payload = MTU − 3 bytes header. Use 20 as safe default.
-      final mtu = _peerMtu[entry.key] ?? 23;
-      final attPayload = mtu - 3;
+      final payload = _peerWritePayload[entry.key] ?? FrameFragmenter.minAttPayload;
       try {
-        if (frame.length <= attPayload) {
+        for (final chunk in _splitter.split(frame, payload)) {
           await _central.writeCharacteristic(
             entry.value,
             char,
-            value: frame,
-            type: GATTCharacteristicWriteType.withoutResponse,
+            value: chunk,
+            type: GATTCharacteristicWriteType.withResponse,
           );
-        } else {
-          // Chunk the frame into ATT-payload-sized pieces.
-          for (var offset = 0; offset < frame.length; offset += attPayload) {
-            final end = (offset + attPayload).clamp(0, frame.length);
-            await _central.writeCharacteristic(
-              entry.value,
-              char,
-              value: Uint8List.sublistView(frame, offset, end),
-              type: GATTCharacteristicWriteType.withoutResponse,
-            );
-          }
         }
         fanout++;
       } catch (e) {
-        debugPrint('BLE write to ${entry.key} failed: $e');
+        debugPrint('BleMesh: write to ${entry.key} failed: $e');
       }
     }
 
-    // Notify subscribed centrals (peripheral role).
-    // BLE notify payloads respect the ATT MTU automatically in the OS stack,
-    // so no manual chunking needed here.
-    final char = _frameChar;
-    if (char != null) {
-      for (final central in List.of(_subscribedCentrals)) {
-        if (excludeCentral != null && central.uuid == excludeCentral.uuid) {
-          continue;
-        }
-        try {
-          await _peripheral.notifyCharacteristic(
-            central,
-            char,
-            value: frame,
-          );
-          fanout++;
-        } catch (e) {
-          debugPrint('BLE notify failed: $e');
-        }
-      }
-    }
-
-    // Broadcast burst via BLE advertisement so nearby scanning devices
-    // intercept the frame immediately without needing an active GATT connection!
-    if (frame.length <= 28) {
+    // ── Peripheral role: notify subscribed centrals ──
+    for (final entry in List.of(_subscribedCentrals.entries)) {
+      if (excludeCentral != null && entry.key == excludeCentral) continue;
+      final char = _frameChar;
+      if (char == null) continue;
+      final payload = await _notifyPayloadFor(entry.key, entry.value);
       try {
-        _peripheral.startAdvertising(Advertisement(
-          name: 'iTantra',
-          serviceUUIDs: [serviceUuid],
-          serviceData: {serviceUuid: frame},
-        ));
+        for (final chunk in _splitter.split(frame, payload)) {
+          await _peripheral.notifyCharacteristic(
+            entry.value,
+            char,
+            value: chunk,
+          );
+        }
         fanout++;
-        // Revert to normal beacon after 4 seconds
-        Future.delayed(const Duration(seconds: 4), () {
-          if (_running) {
-            _peripheral.startAdvertising(Advertisement(
-              name: 'iTantra',
-              serviceUUIDs: [serviceUuid],
-            ));
-          }
-        });
       } catch (e) {
-        debugPrint('BleMesh: broadcast advertising failed: $e');
+        debugPrint('BleMesh: notify ${entry.key} failed: $e');
       }
     }
 
     return fanout;
   }
 
-  void _onDiscovered(DiscoveredEventArgs args) {
-    final key = args.peripheral.uuid;
-
-    // 1. Zero-pairing advertisement broadcast delivery:
-    // If the peer is broadcasting an iBFS frame via serviceData:
-    final sData = args.advertisement.serviceData[serviceUuid];
-    if (sData != null && sData.isNotEmpty) {
-      debugPrint('BleMesh: received broadcast frame via advertisement (${sData.length} bytes)');
-      _dispatch(sData, excludePeripheral: args.peripheral);
+  /// ATT notify payload for a central, negotiated once and cached. Without
+  /// this, a frame bigger than MTU−3 is silently truncated by the OS stack.
+  Future<int> _notifyPayloadFor(String key, Central central) async {
+    final cached = _notifyPayload[key];
+    if (cached != null) return cached;
+    var payload = FrameFragmenter.minAttPayload;
+    try {
+      final max = await _peripheral.getMaximumNotifyLength(central);
+      if (max > FrameFragmenter.headerLen) payload = max;
+    } catch (e) {
+      debugPrint('BleMesh: getMaximumNotifyLength failed: $e');
     }
+    _notifyPayload[key] = payload;
+    return payload;
+  }
 
-    // 2. Filter on iTantra service UUID
-    final hasService = args.advertisement.serviceUUIDs.contains(serviceUuid);
+  void _onDiscovered(DiscoveredEventArgs args) {
+    final advertisement = args.advertisement;
+    final hasService =
+        advertisement.serviceUUIDs.contains(serviceUuid) ||
+            advertisement.serviceData.containsKey(serviceUuid);
     if (!hasService) return;
 
-    // 3. Prevent duplicate connection attempts to avoid GATT 133 collision storms
-    if (_connected.containsKey(key) || _connecting.contains(key)) return;
-    _connecting.add(key);
+    final key = _key(args.peripheral.uuid);
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final record = _knownPeers.putIfAbsent(
+      key,
+      () => _PeerRecord(key, args.peripheral),
+    );
+    record.peripheral = args.peripheral;
+    record.lastSeenMs = now;
 
-    debugPrint('BleMesh: connecting to peer $key...');
-    _central.connect(args.peripheral).then((_) {
+    if (_connected.containsKey(key) || _connecting.contains(key)) return;
+    if (_connecting.length + _connected.length >= _maxPeers) return;
+    record.lastAttemptMs = now;
+    _connectTo(args.peripheral, key);
+  }
+
+  void _connectTo(Peripheral peripheral, String key) {
+    if (!_connecting.add(key)) return;
+    debugPrint('BleMesh: connecting to $key…');
+    _central.connect(peripheral).then((_) {
       _connecting.remove(key);
-    }, onError: (e) {
+      // Android normally reports the connected state through the stream, but
+      // start using the link immediately so a missed stream event cannot
+      // leave the peer permanently "connected but unusable".
+      if (_running && !_connected.containsKey(key) && !_subscribing.contains(key)) {
+        _connected[key] = peripheral;
+        _subscribeAndNegotiate(peripheral, key);
+      }
+    }, onError: (Object e) {
       _connecting.remove(key);
       debugPrint('BleMesh: connect to $key failed: $e');
     });
   }
 
   void _onCentralConnChanged(PeripheralConnectionStateChangedEventArgs args) {
-    final key = args.peripheral.uuid;
+    final key = _key(args.peripheral.uuid);
     _connecting.remove(key);
     if (args.state == ConnectionState.connected) {
       debugPrint('BleMesh: connected to peer $key');
       _connected[key] = args.peripheral;
-      _subscribeAndRequestMtu(args.peripheral);
+      _subscribeAndNegotiate(args.peripheral, key);
     } else {
-      debugPrint('BleMesh: peer $key disconnected (${args.state})');
+      debugPrint('BleMesh: peer $key disconnected');
       _connected.remove(key);
-      _peerFrameChars.remove(key);
-      _peerMtu.remove(key);
+      _peerChars.remove(key);
+      _peerWritePayload.remove(key);
+      _subscribing.remove(key);
+      _reassembler.reset();
+      // Try again shortly — a dropped link should re-form on its own.
+      _knownPeers[key]?.lastAttemptMs = 0;
     }
   }
 
-  Future<void> _subscribeAndRequestMtu(Peripheral peripheral) async {
+  void _onPeripheralConnChanged(CentralConnectionStateChangedEventArgs args) {
+    final key = _key(args.central.uuid);
+    if (args.state == ConnectionState.connected) return;
+    _subscribedCentrals.remove(key);
+    _notifyPayload.remove(key);
+    debugPrint('BleMesh: central $key disconnected');
+  }
+
+  Future<void> _subscribeAndNegotiate(Peripheral peripheral, String key) async {
+    if (!_subscribing.add(key)) return;
     try {
-      // Request the maximum ATT MTU. On Android the stack usually grants 517;
-      // on older / cheap devices it may cap at 23 (20-byte payload). We record
-      // whatever was negotiated so send() can chunk accordingly.
-      int negotiatedMtu = 23; // safe BLE default
+      // Request the largest ATT MTU. Android 14+ fixes this at 517 for the
+      // first client, so failures are expected and harmless.
       try {
-        negotiatedMtu = await _central.requestMTU(peripheral, mtu: 517);
+        await _central.requestMTU(peripheral, mtu: 517);
       } catch (e) {
-        debugPrint('BleMesh: MTU negotiation failed for ${peripheral.uuid}: $e — using $negotiatedMtu bytes');
+        debugPrint('BleMesh: MTU negotiation failed for $key: $e');
       }
-      _peerMtu[peripheral.uuid] = negotiatedMtu;
-      debugPrint('BleMesh: MTU for ${peripheral.uuid} = $negotiatedMtu');
+
+      var payload = FrameFragmenter.minAttPayload;
+      try {
+        final max = await _central.getMaximumWriteLength(
+          peripheral,
+          type: GATTCharacteristicWriteType.withResponse,
+        );
+        if (max > FrameFragmenter.headerLen) payload = max;
+      } catch (e) {
+        debugPrint('BleMesh: getMaximumWriteLength failed for $key: $e');
+      }
+      _peerWritePayload[key] = payload;
+      debugPrint('BleMesh: write payload for $key = $payload bytes');
 
       final services = await _central.discoverGATT(peripheral);
       for (final service in services) {
-        if (service.uuid != serviceUuid) continue;
+        if (service.uuid.value.join(',') != serviceUuid.value.join(',')) continue;
         for (final char in service.characteristics) {
-          if (char.uuid == frameCharUuid) {
-            _peerFrameChars[peripheral.uuid] = char;
-            await _central.setCharacteristicNotifyState(
-              peripheral,
-              char,
-              state: true,
-            );
+          if (char.uuid.value.join(',') != frameCharUuid.value.join(',')) {
+            continue;
           }
+          _peerChars[key] = char;
+          await _central.setCharacteristicNotifyState(
+            peripheral,
+            char,
+            state: true,
+          );
+          debugPrint('BleMesh: subscribed to $key');
         }
       }
     } catch (e) {
-      debugPrint('BLE subscribe failed: $e');
+      debugPrint('BleMesh: subscribe to $key failed: $e');
+    } finally {
+      _subscribing.remove(key);
     }
   }
 
   void _onNotified(GATTCharacteristicNotifiedEventArgs args) {
-    if (args.characteristic.uuid != frameCharUuid) return;
-    _dispatch(args.value, excludePeripheral: args.peripheral);
+    if (args.characteristic.uuid.value.join(',') !=
+        frameCharUuid.value.join(',')) {
+      return;
+    }
+    _ingestChunk(
+      'p/${args.peripheral.uuid.value.join(',')}',
+      args.value,
+      excludePeer: _key(args.peripheral.uuid),
+    );
   }
 
   Future<void> _onWriteRequested(
     GATTCharacteristicWriteRequestedEventArgs args,
   ) async {
+    final isFrameChar = args.characteristic.uuid.value.join(',') ==
+        frameCharUuid.value.join(',');
+    // Acknowledge first: the remote side is blocked on this ATT response.
     try {
       await _peripheral.respondWriteRequest(args.request);
-      _dispatch(args.request.value, excludeCentral: args.central);
     } catch (e) {
-      debugPrint('BLE write response failed: $e');
+      debugPrint('BleMesh: write response failed: $e');
+    }
+    if (!isFrameChar) return;
+    _ingestChunk(
+      'c/${args.central.uuid.value.join(',')}',
+      args.request.value,
+      excludeCentral: _key(args.central.uuid),
+    );
+  }
+
+  void _onNotifyState(GATTCharacteristicNotifyStateChangedEventArgs args) {
+    if (args.characteristic.uuid.value.join(',') !=
+        frameCharUuid.value.join(',')) {
+      return;
+    }
+    final key = _key(args.central.uuid);
+    if (args.state) {
+      _subscribedCentrals[key] = args.central;
+    } else {
+      _subscribedCentrals.remove(key);
+      _notifyPayload.remove(key);
     }
   }
 
-  /// Dedup + relay logic. Frames are identified by the uint32 sequence ID
-  /// (bytes 4–7 of the iBFS header). Each ID is delivered to the app once
-  /// and relayed once to all other peers — flooding without loops.
-  void _dispatch(
+  /// Reassemble chunks, then hand complete frames to [_ingest].
+  void _ingestChunk(
+    String source,
+    Uint8List chunk, {
+    String? excludePeer,
+    String? excludeCentral,
+  }) {
+    final frame = _reassembler.accept(source, chunk);
+    if (frame == null) return;
+    _ingest(frame, excludePeer: excludePeer, excludeCentral: excludeCentral);
+  }
+
+  /// Dedup + relay. Frames are identified by the uint32 sequence ID (bytes 4–7
+  /// of the iBFS header). Each ID is delivered to the app once and relayed once
+  /// to all other peers — flooding without loops.
+  void _ingest(
     Uint8List frame, {
-    Peripheral? excludePeripheral,
-    Central? excludeCentral,
+    String? excludePeer,
+    String? excludeCentral,
   }) {
     if (frame.length < 8) return;
-    final id = ByteData.sublistView(frame).getUint32(4, Endian.big);
+    if (frame[0] != _ibfsMagic0 || frame[1] != _ibfsMagic1) return;
 
+    final id = ByteData.sublistView(frame).getUint32(4, Endian.big);
     final now = DateTime.now().millisecondsSinceEpoch;
-    // Evict cache entries older than 60 s to bound memory.
+    if (_seenIds.containsKey(id)) return;
     if (_seenIds.length > 512) {
-      _seenIds.removeWhere((_, t) => now - t > 60000);
+      _seenIds.removeWhere((_, t) => now - t > _dedupTtlMs);
       if (_seenIds.length > 512) _seenIds.clear();
     }
-    if (_seenIds.containsKey(id)) return; // Already seen — don't relay again.
     _seenIds[id] = now;
 
     if (!_controller.isClosed) _controller.add(frame);
 
-    // Relay to OTHER peers (never echo back to the source).
-    send(frame,
-            excludePeripheral: excludePeripheral, excludeCentral: excludeCentral)
-        .then((_) {}, onError: (e) {
-      debugPrint('BLE relay failed: $e');
+    send(
+      frame,
+      excludePeer: excludePeer,
+      excludeCentral: excludeCentral,
+    ).then((_) {}, onError: (Object e) {
+      debugPrint('BleMesh: relay failed: $e');
     });
   }
 
-  /// Mark a locally originated frame ID as seen so we don't re-deliver our
-  /// own packet when it echoes back through the mesh.
+  /// Mark a locally originated frame ID as seen so it is not re-delivered when
+  /// it echoes back through the mesh.
   void markOriginated(Uint8List frame) {
     if (frame.length < 8) return;
     final id = ByteData.sublistView(frame).getUint32(4, Endian.big);
     _seenIds[id] = DateTime.now().millisecondsSinceEpoch;
   }
 
-  /// Stop the mesh and release radios.
+  /// Stop the mesh and release the radios.
   Future<void> stop() async {
     _running = false;
+    _scanning = false;
+    _scanTimer?.cancel();
+    _retryTimer?.cancel();
+    _scanTimer = null;
+    _retryTimer = null;
+
     try {
       await _central.stopDiscovery();
     } catch (_) {}
@@ -418,19 +604,33 @@ class BleMeshTransport {
     }
     _connected.clear();
     _connecting.clear();
-    _peerFrameChars.clear();
-    _peerMtu.clear();
+    _subscribing.clear();
+    _peerChars.clear();
+    _peerWritePayload.clear();
     _subscribedCentrals.clear();
+    _notifyPayload.clear();
+    _knownPeers.clear();
+    _reassembler.reset();
     try {
       await _peripheral.stopAdvertising();
     } catch (_) {}
+    try {
+      await _peripheral.removeAllServices();
+    } catch (_) {}
+
     await _subDiscovered?.cancel();
-    await _subConn?.cancel();
+    await _subCentralConn?.cancel();
     await _subNotified?.cancel();
     await _subWrite?.cancel();
+    await _subPeripheralConn?.cancel();
     await _subNotifyState?.cancel();
-    _subDiscovered = _subConn = _subNotified = _subWrite = _subNotifyState =
-        null;
+    _subDiscovered = null;
+    _subCentralConn = null;
+    _subNotified = null;
+    _subWrite = null;
+    _subPeripheralConn = null;
+    _subNotifyState = null;
+    _frameChar = null;
   }
 
   /// Tear down completely.
@@ -438,4 +638,15 @@ class BleMeshTransport {
     await stop();
     await _controller.close();
   }
+}
+
+/// A peer remembered from its advertisement, so a dropped link can be retried
+/// without relying on Android re-reporting the device (it caches scan results).
+class _PeerRecord {
+  _PeerRecord(this.key, this.peripheral);
+
+  final String key;
+  Peripheral peripheral;
+  int lastSeenMs = DateTime.now().millisecondsSinceEpoch;
+  int lastAttemptMs = 0;
 }

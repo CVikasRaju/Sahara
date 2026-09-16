@@ -5,7 +5,7 @@ import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 import 'core/theme.dart';
 import 'ml/stt_engine.dart';
 import 'ml/tts_engine.dart';
-import 'net/transport.dart';
+import 'net/mesh_transport.dart';
 import 'state/battery_monitor.dart';
 import 'state/transceiver_controller.dart';
 import 'ui/home_screen.dart';
@@ -22,8 +22,8 @@ void main() {
 class iTantraApp extends StatelessWidget {
   const iTantraApp({super.key});
 
-  /// App-wide transport: starts on loopback, switchable to the BLE mesh.
-  static final SwitchableTransport transport = SwitchableTransport();
+  /// App-wide transport: BLE mesh + Wi-Fi Direct, aggregated and deduplicated.
+  static final MeshTransport transport = MeshTransport();
 
   @override
   Widget build(BuildContext context) {

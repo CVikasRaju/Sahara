@@ -14,9 +14,19 @@ class MainActivity : FlutterActivity() {
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
 
+    private var wifiDirect: WifiDirectPlugin? = null
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+        // Second radio: Wi-Fi Direct group formation + TCP frame relay.
+        // Registered before the Dart side asks for it, so `start` never races
+        // the plugin registration.
+        wifiDirect = WifiDirectPlugin(
+            applicationContext,
+            flutterEngine.dartExecutor.binaryMessenger,
+        )
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, channelName)
             .setMethodCallHandler { call, result ->
@@ -155,6 +165,7 @@ class MainActivity : FlutterActivity() {
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
         abandonAudioFocus()
+        wifiDirect = null
         super.cleanUpFlutterEngine(flutterEngine)
     }
 }

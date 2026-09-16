@@ -6,6 +6,7 @@ import '../core/permissions.dart';
 import '../core/theme.dart';
 import '../ml/ibfs.dart';
 import '../ml/languages.dart';
+import '../net/mesh_transport.dart';
 import '../state/transceiver_controller.dart';
 import 'widgets/alarm_overlay.dart';
 import 'widgets/pipeline_strip.dart';
@@ -102,6 +103,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     return Consumer<TransceiverController>(
       builder: (context, ctrl, _) {
+        // Confirm the radios came up, but do not nag while they are healthy.
         return Stack(
           children: [
             Scaffold(
@@ -138,52 +140,11 @@ class _HomeScreenState extends State<HomeScreen> {
                         ),
                       ),
                     ),
-                  // BLE Mesh peer count indicator
+                  // Live link badge: peer count across BLE + Wi-Fi Direct.
                   Padding(
                     padding: const EdgeInsets.only(right: 4),
                     child: Center(
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 8, vertical: 3),
-                        decoration: BoxDecoration(
-                          color: ctrl.meshActive && ctrl.meshPeerCount > 0
-                              ? iTantraTheme.success.withValues(alpha: 0.15)
-                              : iTantraTheme.surface,
-                          borderRadius: BorderRadius.circular(10),
-                          border: Border.all(
-                            color: ctrl.meshActive && ctrl.meshPeerCount > 0
-                                ? iTantraTheme.success.withValues(alpha: 0.5)
-                                : iTantraTheme.border,
-                          ),
-                        ),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(
-                              ctrl.meshActive && ctrl.meshPeerCount > 0
-                                  ? Icons.hub
-                                  : Icons.hub_outlined,
-                              size: 13,
-                              color: ctrl.meshActive && ctrl.meshPeerCount > 0
-                                  ? iTantraTheme.success
-                                  : iTantraTheme.textMuted,
-                            ),
-                            const SizedBox(width: 3),
-                            Text(
-                              ctrl.meshActive
-                                  ? '${ctrl.meshPeerCount} peer${ctrl.meshPeerCount == 1 ? '' : 's'}'
-                                  : 'offline',
-                              style: TextStyle(
-                                fontSize: 11,
-                                fontWeight: FontWeight.w600,
-                                color: ctrl.meshActive && ctrl.meshPeerCount > 0
-                                    ? iTantraTheme.success
-                                    : iTantraTheme.textMuted,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
+                      child: _LinkBadge(stats: ctrl.linkStats),
                     ),
                   ),
                   // Transceiver toggle
@@ -470,6 +431,68 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         );
       },
+    );
+  }
+}
+
+/// ── Link Badge ─────────────────────────────────────────────────
+
+/// App-bar indicator for the radio state.
+///
+/// This replaces the old two-state `peers` / `offline` pill, which reported
+/// "offline" even while both radios were up and merely still searching for a
+/// peer — so an app that was working looked broken.
+class _LinkBadge extends StatelessWidget {
+  final LinkStats stats;
+
+  const _LinkBadge({required this.stats});
+
+  @override
+  Widget build(BuildContext context) {
+    final connected = stats.hasPeers;
+    final live = stats.anyRunning;
+
+    final Color color = connected
+        ? iTantraTheme.success
+        : live
+            ? iTantraTheme.saffron
+            : iTantraTheme.textMuted;
+
+    final IconData icon = connected
+        ? Icons.hub
+        : live
+            ? Icons.wifi_tethering
+            : Icons.hub_outlined;
+
+    return Tooltip(
+      message: stats.detail,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: connected ? 0.15 : 0.08),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: connected
+                ? color.withValues(alpha: 0.5)
+                : iTantraTheme.border,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 13, color: color),
+            const SizedBox(width: 3),
+            Text(
+              stats.label,
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                color: color,
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

@@ -174,7 +174,7 @@ Uint8List encodeIbfs(IbfPacket packet) {
   final crc = crc16Ccitt(buf.buffer.asUint8List(0, crcOffset));
   buf.setUint16(crcOffset, crc, Endian.big);
 
-  return buf.buffer.asUint8List();
+  return buf.buffer.asUint8List(buf.offsetInBytes, buf.lengthInBytes);
 }
 
 /// ── Decoder ──────────────────────────────────────────────────────
@@ -194,9 +194,14 @@ IbfPacket decodeIbfs(Uint8List bytes) {
     );
   }
 
-  // CRC-16 check
+  // CRC-16 check.
+  // NOTE: ByteData.sublistView honours bytes.offsetInBytes. Using
+  // ByteData.view(bytes.buffer) here read from the start of the *backing*
+  // buffer, so any inbound frame that arrived as a view into a larger buffer
+  // (which is exactly what BLE chunk reassembly produces) decoded garbage.
   final crcOffset = bytes.length - IbfCodec.crcLen;
-  final expectedCrc = ByteData.view(bytes.buffer).getUint16(crcOffset, Endian.big);
+  final view = ByteData.sublistView(bytes);
+  final expectedCrc = view.getUint16(crcOffset, Endian.big);
   final computedCrc = crc16Ccitt(bytes.sublist(0, crcOffset));
   if (expectedCrc != computedCrc) {
     throw IbfDecodeError(
@@ -212,8 +217,8 @@ IbfPacket decodeIbfs(Uint8List bytes) {
   final priorityVal = (b3 >> 4) & 0x0F;
   final langId = b3 & 0x0F;
 
-  final sequenceId = ByteData.view(bytes.buffer).getUint32(4, Endian.big);
-  final payloadLen = ByteData.view(bytes.buffer).getUint16(8, Endian.big);
+  final sequenceId = view.getUint32(4, Endian.big);
+  final payloadLen = view.getUint16(8, Endian.big);
 
   // Validate payload length
   final availablePayload = crcOffset - IbfCodec.headerLen;
@@ -258,7 +263,6 @@ IbfPacket decodeIbfs(Uint8List bytes) {
     if (cursor + 8 > crcOffset) {
       throw IbfDecodeError('GPS flag set but not enough payload bytes');
     }
-    final view = ByteData.view(bytes.buffer);
     lat = view.getFloat32(cursor, Endian.big);
     lon = view.getFloat32(cursor + 4, Endian.big);
     cursor += 8;

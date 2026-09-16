@@ -11,6 +11,7 @@ import '../ml/stt_engine.dart';
 import '../ml/translation_engine.dart';
 import '../ml/tts_engine.dart';
 import '../ml/tts_model_downloader.dart';
+import '../net/mesh_transport.dart';
 import '../net/store_forward.dart';
 import '../net/transport.dart';
 
@@ -115,14 +116,23 @@ class TransceiverController extends ChangeNotifier {
     storeForward = StoreForwardQueue(transport);
     _listenInbound();
     _loadPrefs();
-    // Delay BLE mesh start to allow permissions to be granted first.
-    // The HomeScreen._requestPermissions() runs in initState and triggers
-    // enableMesh() once BT permissions are granted. This timer is a fallback
-    // in case the user grants permissions before the UI is ready.
+
+    // Mirror radio-state changes into the UI. The mesh emits only when the
+    // link signature actually changes, so this does not cause rebuild churn.
+    final t = transport;
+    if (t is MeshTransport) {
+      _linkSubscription = t.linkChanged.listen((_) => notifyListeners());
+    }
+
+    // Delay radio start so the runtime permission dialog can be answered
+    // first. HomeScreen._requestPermissions() also calls enableMesh() as soon
+    // as permissions are granted; this timer is the fallback path.
     Future.delayed(const Duration(seconds: 3), () {
       if (!_meshActive) _startMeshOnInit();
     });
   }
+
+  StreamSubscription<void>? _linkSubscription;
 
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
@@ -130,14 +140,38 @@ class TransceiverController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Auto-start BLE mesh in the background.
+  /// Auto-start the radios in the background.
   Future<void> _startMeshOnInit() async {
     final t = transport;
-    if (t is! SwitchableTransport) return;
-    final ok = await t.enableMesh();
+    if (t is! MeshTransport) return;
+    final ok = await t.start();
     _meshActive = ok;
+    if (!ok) _statusMessage = t.stats.failureHint ?? _statusMessage;
     notifyListeners();
   }
+
+  /// Live radio state (BLE + Wi-Fi Direct), for the app-bar badge.
+  LinkStats get linkStats {
+    final t = transport;
+    if (t is MeshTransport) return t.stats;
+    return const LinkStats(
+      bleRunning: false,
+      bleScanning: false,
+      blePeers: 0,
+      bleKnownPeers: 0,
+      bleStatus: 'off',
+      wifiDirectRunning: false,
+      wifiDirectSupported: false,
+      wifiDirectPeers: 0,
+      wifiDirectStatus: 'off',
+    );
+  }
+
+  /// Short badge text: '2 peers' / 'searching' / 'offline'.
+  String get linkLabel => linkStats.label;
+
+  /// Verbose radio state, e.g. 'BLE 1 peer · Wi-Fi Direct connected'.
+  String get linkDetail => linkStats.detail;
 
   // ── State ──────────────────────────────────────────────────────
   TransceiverPhase _phase = TransceiverPhase.idle;
@@ -340,24 +374,29 @@ class TransceiverController extends ChangeNotifier {
   // ── Mesh Transport ────────────────────────────────────────────
 
   bool _meshActive = false;
+
+  /// Whether at least one radio is up. `false` only when both radios failed.
   bool get meshActive => _meshActive;
 
-  /// Enable the BLE mesh transport (falls back to loopback on failure).
+  /// Start (or re-start) the radios. Idempotent — safe to call on a timer.
   Future<bool> enableMesh() async {
     final t = transport;
-    if (t is! SwitchableTransport) return false;
+    if (t is! MeshTransport) return false;
     if (_meshActive) return true;
-    final ok = await t.enableMesh();
+    final ok = await t.start();
     _meshActive = ok;
+    // Both radios down is actionable, not mysterious: say which one refused
+    // and what to switch on.
+    if (!ok) _statusMessage = t.stats.failureHint ?? _statusMessage;
     notifyListeners();
     return ok;
   }
 
-  /// Number of connected mesh peers (0 in loopback mode).
-  int get meshPeerCount =>
-      transport is SwitchableTransport
-          ? (transport as SwitchableTransport).meshPeerCount
-          : 0;
+  /// Number of peers reachable across both radios.
+  int get meshPeerCount => linkStats.totalPeers;
+
+  /// Whether a frame can reach another device right now.
+  bool get hasReachablePeer => linkStats.hasPeers;
 
   // ── PTT Controls ───────────────────────────────────────────────
 
@@ -521,6 +560,7 @@ class TransceiverController extends ChangeNotifier {
       transferMs = await transport.send(frame);
     } catch (e) {
       // Queue for store-and-forward (ADDITIONAL_FEATURES.md §3).
+      final reason = e is StateError ? e.message : e.toString();
       storeForward.enqueue(frame, sequenceId: _sequenceId);
       _addLog(LogEntry(
         id: _sequenceId,
@@ -532,7 +572,8 @@ class TransceiverController extends ChangeNotifier {
         sttMs: sttMs,
         lat: lat,
         lon: lon,
-        error: 'Queued (${storeForward.pendingCount} pending)',
+        error: 'Not delivered — $reason\nQueued '
+            '(${storeForward.pendingCount}) for automatic retry',
       ));
       _phase = TransceiverPhase.idle;
       _interimText = '';
@@ -563,9 +604,14 @@ class TransceiverController extends ChangeNotifier {
 
   // ── Receive Path ───────────────────────────────────────────────
 
+  /// Inbound frames are handled strictly one at a time. Frames can arrive
+  /// back-to-back on PTT release, and overlapping TTS calls would speak over
+  /// each other.
+  Future<void> _inboundChain = Future<void>.value();
+
   void _listenInbound() {
     transport.incoming.listen((bytes) {
-      _handleInbound(bytes);
+      _inboundChain = _inboundChain.then((_) => _handleInbound(bytes));
     });
   }
 
@@ -589,10 +635,17 @@ class TransceiverController extends ChangeNotifier {
       return;
     }
 
+    // ── Half-duplex (PTT) discipline ──
+    // A walkie-talkie is half duplex: while this device is recording,
+    // processing or transmitting, the incoming voice is logged but NOT played,
+    // otherwise the speaker would be picked up by our own microphone and
+    // immediately re-transmitted.
+    final bool busyTransmitting = _phase != TransceiverPhase.idle;
+
     // ── Cross-lingual translation + neural TTS (ARCHITECTURE.md §2.4) ──
     // If the packet language differs from our receiver language, translate
-    // the text on-device (ML Kit), then speak the translation with the
-    // receiver language's neural voice.
+    // the text on-device, then speak the translation with the receiver
+    // language's neural voice.
     final bool sameLang = packet.language.iso639 == _receiverLang.iso639;
     String displayText = packet.text;
     String spokenText = packet.text;
@@ -600,7 +653,8 @@ class TransceiverController extends ChangeNotifier {
 
     if (!sameLang) {
       // Ensure the receiver's voice is available (downloads once, ~114 MB).
-      await _ensureTtsModels(_receiverLang);
+      // Skipped while we are on air so a download never delays the next packet.
+      if (!busyTransmitting) await _ensureTtsModels(_receiverLang);
 
       final translated = await translator.translate(
         packet.text,
@@ -613,17 +667,21 @@ class TransceiverController extends ChangeNotifier {
         ttsLang = _receiverLang;
       }
       // Translation unavailable: fall back to showing the original text.
-    } else {
+    } else if (!busyTransmitting) {
       // Same language: still make sure the neural voice is ready.
       await _ensureTtsModels(_receiverLang);
     }
 
     final int? ttsMs;
-    // Speak in the (possibly translated) target language.
-    final ttsStart = DateTime.now().millisecondsSinceEpoch;
-    await tts.speak(spokenText,
-        lang: ttsLang, emergency: packet.priority == Priority.emergency);
-    ttsMs = DateTime.now().millisecondsSinceEpoch - ttsStart;
+    if (busyTransmitting) {
+      // Received while we were on air — show it, stay silent.
+      ttsMs = null;
+    } else {
+      final ttsStart = DateTime.now().millisecondsSinceEpoch;
+      await tts.speak(spokenText,
+          lang: ttsLang, emergency: packet.priority == Priority.emergency);
+      ttsMs = DateTime.now().millisecondsSinceEpoch - ttsStart;
+    }
 
     final e2eMs = DateTime.now().millisecondsSinceEpoch - e2eStart;
 
@@ -712,6 +770,7 @@ class TransceiverController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _linkSubscription?.cancel();
     transport.disconnect();
     stt.dispose();
     tts.dispose();
