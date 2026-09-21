@@ -49,16 +49,41 @@ enum Priority {
 }
 
 /// Extended payload flags byte (NETWORK_PROTOCOL.md §4).
+///
+/// ```
+/// bit 7  HasGPS          lat + lon follow (float32 x2)
+/// bit 6  HasSourceLang   sender's language follows (1 byte)
+/// bit 5  HasSenderName   name length (1 byte) + UTF-8 name follow
+/// bit 4  HasExtLang      extended language ID follows (1 byte)
+/// bit 0-3 Reserved
+/// ```
+///
+/// The extension fields are always written in that order, so a receiver can
+/// walk the payload with nothing but this byte.
 class PayloadFlags {
   final bool hasGps;
   final bool hasSourceLang;
 
-  const PayloadFlags({this.hasGps = false, this.hasSourceLang = false});
+  /// Whether a sender display name is present.
+  final bool hasSenderName;
+
+  /// Whether the 4-bit header language is the `0xF` escape, meaning the real
+  /// language ID travels in a payload byte.
+  final bool hasExtLang;
+
+  const PayloadFlags({
+    this.hasGps = false,
+    this.hasSourceLang = false,
+    this.hasSenderName = false,
+    this.hasExtLang = false,
+  });
 
   int toByte() {
     int b = 0;
     if (hasGps) b |= 0x80;
     if (hasSourceLang) b |= 0x40;
+    if (hasSenderName) b |= 0x20;
+    if (hasExtLang) b |= 0x10;
     return b;
   }
 
@@ -66,6 +91,8 @@ class PayloadFlags {
     return PayloadFlags(
       hasGps: (b & 0x80) != 0,
       hasSourceLang: (b & 0x40) != 0,
+      hasSenderName: (b & 0x20) != 0,
+      hasExtLang: (b & 0x10) != 0,
     );
   }
 }
@@ -83,6 +110,12 @@ class IbfPacket {
   final Lang? sourceLang;
   final int? measuredTransferMs;
 
+  /// Who sent this message, as set in the sender's Settings screen.
+  ///
+  /// Limited to [kMaxSenderNameChars] characters so it never crowds out the
+  /// actual message on a 512-byte payload.
+  final String? senderName;
+
   const IbfPacket({
     required this.type,
     required this.priority,
@@ -94,7 +127,16 @@ class IbfPacket {
     this.longitude,
     this.sourceLang,
     this.measuredTransferMs,
+    this.senderName,
   });
+
+  /// The message as it should be shown and spoken, with the sender's name
+  /// prefixed when one was transmitted.
+  String get displayText {
+    final name = senderName?.trim();
+    if (name == null || name.isEmpty) return text;
+    return '[$name] $text';
+  }
 
   /// Whether this packet is an explicit SOS alert (Packet Type 0x2).
   ///
@@ -121,6 +163,17 @@ class IbfDecodeError implements Exception {
 
 /// ── Encoder ──────────────────────────────────────────────────────
 
+/// Longest sender name accepted on the wire.
+///
+/// The Settings screen enforces the same limit; the encoder clamps again so a
+/// name can never overflow the payload or the one-byte length field.
+const int kMaxSenderNameChars = 8;
+
+/// Hard byte ceiling for a sender name (8 Indic characters can be 24+ bytes).
+const int _maxSenderNameBytes = 64;
+
+/// ── Encoder ──────────────────────────────────────────────────────
+
 /// Encode an [IbfPacket] into its wire-format bytes.
 ///
 /// The flags byte is written *unconditionally* — this is a deliberate fix:
@@ -135,20 +188,37 @@ Uint8List encodeIbfs(IbfPacket packet) {
     );
   }
 
-  // Build extended payload bytes.
+  // ── Payload extensions ───────────────────────────────────────────
+  // The flags are derived from the bytes actually being written, not taken
+  // from `packet.flags`. A caller-supplied flag byte is a footgun: a flag set
+  // without its bytes (or bytes written without their flag) shifts every
+  // field after it and destroys the frame. Deriving them here makes the
+  // encoder and decoder agree by construction.
   final gpsBytes = _encodeGps(packet.latitude, packet.longitude);
-  final srcLangByte = packet.flags.hasSourceLang && packet.sourceLang != null
-      ? [packet.sourceLang!.wireId & 0x0F]
+  final srcLangByte = packet.sourceLang != null
+      ? [langToByte(packet.sourceLang!)]
       : <int>[];
+  // The header nibble holds 0xF for languages past the 15 directly
+  // addressable IDs; the real ID travels here.
+  final extLangByte = packet.language.isExtended
+      ? [packet.language.extId! & 0xFF]
+      : <int>[];
+  final nameBytes = _encodeSenderName(packet.senderName);
 
-  // Flags byte (always present).
-  final flagsByte = packet.flags.toByte();
+  final flags = PayloadFlags(
+    hasGps: gpsBytes.isNotEmpty,
+    hasSourceLang: srcLangByte.isNotEmpty,
+    hasSenderName: nameBytes.isNotEmpty,
+    hasExtLang: extLangByte.isNotEmpty,
+  );
 
-  // Assemble: flags + gps + srcLang + text
+  // Assemble: flags + gps + srcLang + extLang + name + text
   final payload = [
-    flagsByte,
+    flags.toByte(),
     ...gpsBytes,
     ...srcLangByte,
+    ...extLangByte,
+    ...nameBytes,
     ...textBytes,
   ];
 
@@ -241,12 +311,6 @@ IbfPacket decodeIbfs(Uint8List bytes) {
     );
   }
 
-  // Parse language
-  final lang = langByWireId(langId);
-  if (lang == null) {
-    throw IbfDecodeError('Unknown language wire ID: $langId');
-  }
-
   // Parse packet type
   final type = PacketType.values.firstWhere(
     (t) => t.value == typeVal,
@@ -265,15 +329,15 @@ IbfPacket decodeIbfs(Uint8List bytes) {
   }
 
   final payloadStart = IbfCodec.headerLen;
-  final flagsByte = bytes[payloadStart];
-  final flags = PayloadFlags.fromByte(flagsByte);
+  final payloadEnd = payloadStart + payloadLen;
+  final flags = PayloadFlags.fromByte(bytes[payloadStart]);
 
   var cursor = payloadStart + 1; // past flags byte
 
   double? lat;
   double? lon;
   if (flags.hasGps) {
-    if (cursor + 8 > crcOffset) {
+    if (cursor + 8 > payloadEnd) {
       throw IbfDecodeError('GPS flag set but not enough payload bytes');
     }
     lat = view.getFloat32(cursor, Endian.big);
@@ -283,15 +347,51 @@ IbfPacket decodeIbfs(Uint8List bytes) {
 
   Lang? sourceLang;
   if (flags.hasSourceLang) {
-    if (cursor + 1 > crcOffset) {
+    if (cursor + 1 > payloadEnd) {
       throw IbfDecodeError('SourceLang flag set but not enough payload bytes');
     }
-    sourceLang = langByWireId(bytes[cursor] & 0x0F);
+    sourceLang = langFromByte(bytes[cursor]);
     cursor += 1;
   }
 
+  int? extLangId;
+  if (flags.hasExtLang) {
+    if (cursor + 1 > payloadEnd) {
+      throw IbfDecodeError('ExtLang flag set but not enough payload bytes');
+    }
+    extLangId = bytes[cursor] & 0xFF;
+    cursor += 1;
+  }
+
+  String? senderName;
+  if (flags.hasSenderName) {
+    if (cursor + 1 > payloadEnd) {
+      throw IbfDecodeError('SenderName flag set but not enough payload bytes');
+    }
+    final nameLen = bytes[cursor] & 0xFF;
+    cursor += 1;
+    if (cursor + nameLen > payloadEnd) {
+      throw IbfDecodeError(
+        'Sender name length $nameLen exceeds remaining payload',
+      );
+    }
+    senderName = utf8
+        .decode(bytes.sublist(cursor, cursor + nameLen), allowMalformed: true)
+        .trim();
+    cursor += nameLen;
+  }
+
+  // Resolve the language *after* the payload is walked, because an escaped
+  // language (header nibble 0xF) carries its real ID inside the payload.
+  //
+  // An unrecognised ID means the sender is a newer build using a language
+  // this one does not know. Fall back to English rather than rejecting the
+  // frame: on a distress channel a readable message beats a dropped one, and
+  // the CRC has already proven the bytes are intact.
+  final lang = langByWireId(langId, extId: extLangId) ?? kEnglish;
+
   // Remaining bytes are the UTF-8 text
-  final textBytes = bytes.sublist(cursor, payloadStart + payloadLen);
+  final textBytes = bytes.sublist(cursor, payloadEnd);
   final text = utf8.decode(textBytes, allowMalformed: true);
 
   return IbfPacket(
@@ -304,7 +404,35 @@ IbfPacket decodeIbfs(Uint8List bytes) {
     latitude: lat,
     longitude: lon,
     sourceLang: sourceLang,
+    senderName: senderName,
   );
+}
+
+/// Encode a sender name as `[length][utf-8 bytes]`, or empty when absent.
+///
+/// The length is a single byte, so the name is clamped to
+/// [kMaxSenderNameChars] characters *and* [_maxSenderNameBytes] bytes — eight
+/// Devanagari characters can be 24 bytes, and a name must never be able to
+/// push the message itself out of the payload.
+List<int> _encodeSenderName(String? name) {
+  final trimmed = name?.trim() ?? '';
+  if (trimmed.isEmpty) return const <int>[];
+
+  var chars = trimmed.runes.toList();
+  if (chars.length > kMaxSenderNameChars) {
+    chars = chars.sublist(0, kMaxSenderNameChars);
+  }
+
+  var encoded = utf8.encode(String.fromCharCodes(chars));
+  if (encoded.length > _maxSenderNameBytes) {
+    // Drop whole characters until it fits, so the UTF-8 stays well-formed.
+    while (chars.isNotEmpty && encoded.length > _maxSenderNameBytes) {
+      chars = chars.sublist(0, chars.length - 1);
+      encoded = utf8.encode(String.fromCharCodes(chars));
+    }
+  }
+  if (encoded.isEmpty) return const <int>[];
+  return <int>[encoded.length, ...encoded];
 }
 
 /// ── GPS Helpers ──────────────────────────────────────────────────
@@ -349,14 +477,35 @@ const Map<String, List<String>> _distressKeywords = {
   'ml': ['സഹായം', 'രക്ഷിക്കൂ', 'മുറിവേറ്റ', 'കുടുങ്ങിയ', 'തീ', 'emergency', 'help', 'trapped'],
   'or': ['ସାହାଯ୍ୟ', 'ବଞ୍ଚାଅ', 'ଆହତ', 'ଫସିଯାଇଛନ୍ତି', 'ଅଗ୍ନି', 'emergency', 'help', 'trapped'],
   'bn': ['সাহায্য', 'বাঁচাও', 'আহত', 'আটকে', 'আগুন', 'emergency', 'help', 'trapped'],
+  'pa': ['ਮਦਦ', 'ਬਚਾਓ', 'ਜ਼ਖ਼ਮੀ', 'ਫਸੇ', 'ਅੱਗ'],
+  'ur': ['مدد', 'بچا', 'زخمی', 'پھنس', 'آگ'],
+  'as': ['সহায়', 'উদ্ধাৰ', 'আঘাত', 'আগুন'],
+  'ne': ['मद्दत', 'उद्धार', 'घायल', 'आगो'],
+  'kok': ['आदार', 'वाचय', 'घायल'],
+  'mai': ['मदति', 'बचाउ', 'आघात'],
+  'sa': ['सहायता', 'रक्ष', 'अग्नि'],
+  'sd': ['مدد', 'بچايو', 'زخمي'],
+  'doi': ['मदद', 'बचाओ', 'ज़ख्मी'],
+  'ks': ['مدد', 'بچاؤ', 'زخمی'],
   'en': ['help', 'trapped', 'injured', 'fire', 'emergency', 'sos', 'danger'],
 };
 
 /// Returns `true` if the [text] contains distress keywords for the given
-/// [langIso639] language code. Falls back to English keywords if the
-/// language is not in the keyword map.
+/// [langIso639] language code.
+///
+/// The language's own keyword list is checked **together with** the English
+/// one — never instead of it. Indic speech recognition frequently emits Latin
+/// transliterations, and an English loanword ("help", "emergency") is common
+/// even in an otherwise Hindi or Kannada sentence; missing a real distress
+/// call because the speaker code-switched is far worse than a false positive
+/// that merely raises a priority flag.
+///
+/// Languages with no keyword list (e.g. Bodo, Santali) are still covered by
+/// the English list, which is the conservative fallback.
 bool detectDistress(String text, String langIso639) {
   final lowerText = text.toLowerCase();
-  final keywords = _distressKeywords[langIso639] ?? _distressKeywords['en']!;
+  final english = _distressKeywords['en']!;
+  final own = _distressKeywords[langIso639];
+  final keywords = own == null ? english : [...own, ...english];
   return keywords.any((kw) => lowerText.contains(kw.toLowerCase()));
 }

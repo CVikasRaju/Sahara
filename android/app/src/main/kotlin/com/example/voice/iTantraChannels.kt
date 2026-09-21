@@ -37,6 +37,38 @@ object iTantraChannels {
     private var audioManager: AudioManager? = null
     private var focusRequest: AudioFocusRequest? = null
 
+    /**
+     * The SOS channel, retained so native code can call back into Dart.
+     *
+     * The volume-key hold is detected in the Activity, but the *decision* to
+     * send an SOS lives in Dart (it owns the radio and the preference), so the
+     * Activity needs a way to reach the channel without holding a reference to
+     * the engine — which is exactly what this is for.
+     */
+    private var sosChannel: MethodChannel? = null
+
+    /** Whether the hardware shortcut may fire. Mirrored from the Dart setting. */
+    @Volatile
+    var silentSosEnabled: Boolean = false
+        private set
+
+    /**
+     * Deliver a hardware-triggered SOS to Dart.
+     *
+     * Returns false when the shortcut is disabled or the engine is not up, so
+     * the caller can leave the key event alone.
+     */
+    fun notifySilentSos(): Boolean {
+        val channel = sosChannel ?: return false
+        if (!silentSosEnabled) return false
+        return try {
+            channel.invokeMethod("onSilentSos", null)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     fun register(engine: FlutterEngine, context: Context) {
         val messenger = engine.dartExecutor.binaryMessenger
         audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -217,8 +249,17 @@ object iTantraChannels {
     // ── SOS standby + emergency alerting ─────────────────────────────
 
     private fun registerSosService(messenger: BinaryMessenger, context: Context) {
-        MethodChannel(messenger, SOS_CHANNEL).setMethodCallHandler { call, result ->
+        val channel = MethodChannel(messenger, SOS_CHANNEL)
+        sosChannel = channel
+        channel.setMethodCallHandler { call, result ->
             when (call.method) {
+                // Enable/disable the volume-key shortcut. Driven by the
+                // Settings switch, so there is one source of truth for it.
+                "setSilentSosEnabled" -> {
+                    silentSosEnabled = call.argument<Boolean>("enabled") ?: false
+                    result.success(true)
+                }
+
                 "startStandby" -> {
                     if (!SosService.canRunConnectedDeviceService(context)) {
                         result.success(false)

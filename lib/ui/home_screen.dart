@@ -7,8 +7,11 @@ import '../core/theme.dart';
 import '../ml/ibfs.dart';
 import '../ml/languages.dart';
 import '../net/mesh_transport.dart';
+import '../state/app_settings.dart';
 import '../state/transceiver_controller.dart';
+import 'settings_screen.dart';
 import 'widgets/alarm_overlay.dart';
+import 'widgets/offline_map.dart';
 import 'widgets/pipeline_strip.dart';
 import 'widgets/ptt_button.dart';
 import 'widgets/sos_button.dart';
@@ -113,8 +116,75 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
     }
   }
 
+  /// Open the offline map for a distress position.
+  void _showPositionDialog({
+    required double lat,
+    required double lon,
+    required String label,
+  }) {
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: iTantraTheme.surface,
+        insetPadding: const EdgeInsets.all(16),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(14),
+          side: const BorderSide(color: iTantraTheme.border),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.location_on,
+                      size: 18, color: iTantraTheme.danger),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      'Distress position',
+                      style: const TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w700,
+                        color: iTantraTheme.textPrimary,
+                      ),
+                    ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.close,
+                        size: 18, color: iTantraTheme.textMuted),
+                    onPressed: () => Navigator.of(ctx).pop(),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 320,
+                width: 320,
+                child: OfflineMapView(lat: lat, lon: lon, label: label),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Rendered from tiles stored on this device. Drag to pan, '
+                'pinch or use + / − to zoom.',
+                style: TextStyle(
+                  fontSize: 10,
+                  color: iTantraTheme.textMuted,
+                  height: 1.35,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final settings = context.watch<AppSettings>();
     return Consumer<TransceiverController>(
       builder: (context, ctrl, _) {
         // Confirm the radios came up, but do not nag while they are healthy.
@@ -161,6 +231,18 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       child: _LinkBadge(stats: ctrl.linkStats),
                     ),
                   ),
+                  // Settings
+                  IconButton(
+                    icon: const Icon(Icons.settings, size: 20),
+                    tooltip: 'Settings',
+                    onPressed: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => const SettingsScreen(),
+                        ),
+                      );
+                    },
+                  ),
                   // Transceiver toggle
                   Switch(
                     value: _transceiverOn,
@@ -186,6 +268,24 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     onSenderLangChanged: (l) => ctrl.senderLang = l,
                     onReceiverLangChanged: (l) => ctrl.receiverLang = l,
                     onGpsToggled: (v) => ctrl.gpsEnabled = v,
+                  ),
+
+                  // ── Mode / Role Bar ───────────────────────────
+                  _ModeBar(
+                    settings: settings,
+                    handsFreeActive: ctrl.handsFreeActive,
+                    onToggleMode: () {
+                      settings.operationMode = settings.isHandsFree
+                          ? OperationMode.walkieTalkie
+                          : OperationMode.phone;
+                    },
+                    onOpenSettings: () {
+                      Navigator.of(context).push(
+                        MaterialPageRoute<void>(
+                          builder: (_) => const SettingsScreen(),
+                        ),
+                      );
+                    },
                   ),
 
                   // ── Model Download Banner ─────────────────────
@@ -282,15 +382,11 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   // ── PTT Button ────────────────────────────────
                   Expanded(
                     flex: 2,
-                    child: Center(
-                      child: PttButton(
-                        isActive: _transceiverOn && !ctrl.modelsDownloading,
-                        isRecording: ctrl.isRecording,
-                        isProcessing: ctrl.isProcessing,
-                        onPressed: () => ctrl.startPtt(),
-                        onReleased: () => ctrl.stopPtt(),
-                      ),
-                    ),
+                    child: Center(child: _TalkArea(
+                      transceiverOn: _transceiverOn,
+                      ctrl: ctrl,
+                      settings: settings,
+                    )),
                   ),
 
                   // ── Model Download Button (when models not ready) ──
@@ -459,7 +555,14 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                   // ── Packet Log ────────────────────────────────
                   Expanded(
                     flex: 3,
-                    child: _PacketLog(log: ctrl.log),
+                    child: _PacketLog(
+                      log: ctrl.log,
+                      onOpenMap: (entry) => _showPositionDialog(
+                        lat: entry.lat!,
+                        lon: entry.lon!,
+                        label: entry.senderName ?? entry.langName,
+                      ),
+                    ),
                   ),
                 ],
               ),
@@ -471,7 +574,19 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 label: ctrl.alarmLabel,
                 text: ctrl.alarmText,
                 sos: ctrl.alarmIsSos,
-                durationSeconds: ctrl.alarmIsSos ? 20 : 9,
+                sender: ctrl.alarmSender,
+                // 5 s for a keyword-triggered emergency alert; an explicit SOS
+                // keeps ringing far longer because somebody needs help.
+                durationSeconds: ctrl.alarmIsSos
+                    ? TransceiverController.kSosAlertSeconds.inSeconds
+                    : TransceiverController.kEmergencyAlertSeconds.inSeconds,
+                onViewMap: ctrl.alarmHasPosition
+                    ? () => _showPositionDialog(
+                          lat: ctrl.alarmLat!,
+                          lon: ctrl.alarmLon!,
+                          label: ctrl.alarmSender ?? ctrl.alarmLabel,
+                        )
+                    : null,
               ),
           ],
         );
@@ -867,7 +982,11 @@ class _LangSelector extends StatelessWidget {
 
 class _PacketLog extends StatelessWidget {
   final List<LogEntry> log;
-  const _PacketLog({required this.log});
+
+  /// Opens the offline map for an entry that carries a position.
+  final ValueChanged<LogEntry>? onOpenMap;
+
+  const _PacketLog({required this.log, this.onOpenMap});
 
   @override
   Widget build(BuildContext context) {
@@ -890,7 +1009,7 @@ class _PacketLog extends StatelessWidget {
       reverse: true, // newest at top
       itemBuilder: (context, index) {
         final entry = log[log.length - 1 - index];
-        return _LogEntryCard(entry: entry);
+        return _LogEntryCard(entry: entry, onOpenMap: onOpenMap);
       },
     );
   }
@@ -898,14 +1017,16 @@ class _PacketLog extends StatelessWidget {
 
 class _LogEntryCard extends StatelessWidget {
   final LogEntry entry;
-  const _LogEntryCard({required this.entry});
+  final ValueChanged<LogEntry>? onOpenMap;
+
+  const _LogEntryCard({required this.entry, this.onOpenMap});
 
   @override
   Widget build(BuildContext context) {
     final isEmergency = entry.priority == Priority.emergency;
     final isError = entry.error != null;
 
-    return Container(
+    final card = Container(
       margin: const EdgeInsets.only(bottom: 8),
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
@@ -968,6 +1089,27 @@ class _LogEntryCard extends StatelessWidget {
                   ),
                 ),
               ),
+              // Who sent it, when the sender transmitted a name.
+              if (entry.senderName != null &&
+                  entry.senderName!.isNotEmpty) ...[
+                const SizedBox(width: 4),
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+                  decoration: BoxDecoration(
+                    color: iTantraTheme.saffron.withValues(alpha: 0.18),
+                    borderRadius: BorderRadius.circular(3),
+                  ),
+                  child: Text(
+                    entry.senderName!,
+                    style: const TextStyle(
+                      fontSize: 9,
+                      fontWeight: FontWeight.w700,
+                      color: iTantraTheme.saffron,
+                    ),
+                  ),
+                ),
+              ],
               if (isEmergency) ...[
                 const SizedBox(width: 4),
                 const Icon(Icons.warning_amber_rounded,
@@ -1013,6 +1155,16 @@ class _LogEntryCard extends StatelessWidget {
                   _Timing(label: 'TX', ms: entry.transferMs!),
                 if (entry.ttsMs != null)
                   _Timing(label: 'TTS', ms: entry.ttsMs!),
+                // Recognizer-only time and its real-time factor. RTF below
+                // 1.0 means transcription ran faster than real time.
+                if (entry.decodeMs != null)
+                  _Timing(label: 'ASR', ms: entry.decodeMs!),
+                if (entry.rtf != null)
+                  _Timing(
+                    label: 'RTF',
+                    ms: 0,
+                    text: entry.rtf!.toStringAsFixed(2),
+                  ),
                 if (entry.e2eMs != null)
                   _Timing(label: 'E2E', ms: entry.e2eMs!, bold: true),
               ],
@@ -1024,8 +1176,13 @@ class _LogEntryCard extends StatelessWidget {
             const SizedBox(height: 4),
             Row(
               children: [
-                const Icon(Icons.location_on,
-                    size: 11, color: iTantraTheme.textMuted),
+                Icon(
+                  Icons.location_on,
+                  size: 11,
+                  color: entry.hasPosition && onOpenMap != null
+                      ? iTantraTheme.danger
+                      : iTantraTheme.textMuted,
+                ),
                 const SizedBox(width: 3),
                 Text(
                   '${entry.lat!.toStringAsFixed(4)}, ${entry.lon!.toStringAsFixed(4)}',
@@ -1035,11 +1192,21 @@ class _LogEntryCard extends StatelessWidget {
                     color: iTantraTheme.textMuted,
                   ),
                 ),
+                if (onOpenMap != null) ...[
+                  const SizedBox(width: 6),
+                  const Text(
+                    'tap for map',
+                    style: TextStyle(
+                      fontSize: 9,
+                      color: iTantraTheme.saffron,
+                    ),
+                  ),
+                ],
               ],
             ),
           ],
 
-          // Error
+          // Error / translation note
           if (isError) ...[
             const SizedBox(height: 4),
             Text(
@@ -1054,6 +1221,16 @@ class _LogEntryCard extends StatelessWidget {
         ],
       ),
     );
+
+    // An entry with coordinates becomes the entry point to the offline map.
+    if (entry.hasPosition && onOpenMap != null) {
+      return InkWell(
+        onTap: () => onOpenMap!(entry),
+        borderRadius: BorderRadius.circular(8),
+        child: card,
+      );
+    }
+    return card;
   }
 
   String _formatTime(DateTime dt) {
@@ -1067,17 +1244,314 @@ class _Timing extends StatelessWidget {
   final String label;
   final int ms;
   final bool bold;
-  const _Timing({required this.label, required this.ms, this.bold = false});
+
+  /// Literal value shown instead of '$ms ms' (used for the unit-less RTF).
+  final String? text;
+
+  const _Timing({
+    required this.label,
+    required this.ms,
+    this.bold = false,
+    this.text,
+  });
 
   @override
   Widget build(BuildContext context) {
     return Text(
-      '$label ${ms}ms',
+      '$label ${text ?? '${ms}ms'}',
       style: TextStyle(
         fontSize: 10,
         fontFamily: 'monospace',
         fontWeight: bold ? FontWeight.w700 : FontWeight.w400,
         color: iTantraTheme.textSecondary,
+      ),
+    );
+  }
+}
+
+/// ── Mode / Role Bar ────────────────────────────────────────────
+
+/// Compact strip showing the active operation mode and device role.
+///
+/// Both are one tap away from changing, because they are the two settings a
+/// person demonstrating the app on two phones needs to flip in a hurry.
+class _ModeBar extends StatelessWidget {
+  const _ModeBar({
+    required this.settings,
+    required this.handsFreeActive,
+    required this.onToggleMode,
+    required this.onOpenSettings,
+  });
+
+  final AppSettings settings;
+  final bool handsFreeActive;
+  final VoidCallback onToggleMode;
+  final VoidCallback onOpenSettings;
+
+  @override
+  Widget build(BuildContext context) {
+    final roleLabel = switch (settings.role) {
+      AppRole.transceiver => 'Transceiver',
+      AppRole.sttOnly => 'STT only',
+      AppRole.ttsOnly => 'TTS only',
+    };
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      decoration: const BoxDecoration(
+        color: iTantraTheme.surface,
+        border: Border(bottom: BorderSide(color: iTantraTheme.border)),
+      ),
+      child: Row(
+        children: [
+          _MiniChip(
+            icon: settings.isHandsFree ? Icons.hearing : Icons.touch_app,
+            label: settings.isHandsFree ? 'PHONE / HANDS-FREE' : 'WALKIE-TALKIE',
+            onTap: onToggleMode,
+          ),
+          if (handsFreeActive) ...[
+            const SizedBox(width: 6),
+            _MiniChip(
+              icon: Icons.mic,
+              label: 'LISTENING',
+              color: iTantraTheme.success,
+            ),
+          ],
+          const Spacer(),
+          _MiniChip(
+            icon: Icons.badge_outlined,
+            label: roleLabel.toUpperCase(),
+            onTap: onOpenSettings,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MiniChip extends StatelessWidget {
+  const _MiniChip({
+    required this.icon,
+    required this.label,
+    this.color,
+    this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final Color? color;
+  final VoidCallback? onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = color ?? iTantraTheme.saffron;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(8),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+        decoration: BoxDecoration(
+          color: c.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: c.withValues(alpha: 0.4)),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 11, color: c),
+            const SizedBox(width: 4),
+            Text(
+              label,
+              style: TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 0.6,
+                color: c,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// ── Talk Area ──────────────────────────────────────────────────
+
+/// The centre control, which differs per role and per operation mode.
+class _TalkArea extends StatelessWidget {
+  const _TalkArea({
+    required this.transceiverOn,
+    required this.ctrl,
+    required this.settings,
+  });
+
+  final bool transceiverOn;
+  final TransceiverController ctrl;
+  final AppSettings settings;
+
+  @override
+  Widget build(BuildContext context) {
+    // Receiver-only role: there is no microphone, so show an explicit state
+    // instead of a button that would silently do nothing.
+    if (!settings.canTransmit) {
+      return const _RolePlaceholder(
+        icon: Icons.volume_up,
+        title: 'TTS MODE — RECEIVER ONLY',
+        detail: 'Waiting for incoming mesh packets.\nThe microphone is '
+            'disabled in this role.',
+      );
+    }
+
+    if (ctrl.handsFreeActive) {
+      return _HandsFreePanel(
+        interim: ctrl.interimText,
+        paused: ctrl.isProcessing,
+        onStop: () => ctrl.stopHandsFree(),
+      );
+    }
+
+    return PttButton(
+      isActive: transceiverOn && !ctrl.modelsDownloading,
+      isRecording: ctrl.isRecording,
+      isProcessing: ctrl.isProcessing,
+      onPressed: () => ctrl.startPtt(),
+      onReleased: () => ctrl.stopPtt(),
+    );
+  }
+}
+
+class _RolePlaceholder extends StatelessWidget {
+  const _RolePlaceholder({
+    required this.icon,
+    required this.title,
+    required this.detail,
+  });
+
+  final IconData icon;
+  final String title;
+  final String detail;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 24),
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: iTantraTheme.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: iTantraTheme.border),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 42, color: iTantraTheme.saffron),
+          const SizedBox(height: 10),
+          Text(
+            title,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 1.2,
+              color: iTantraTheme.saffron,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            detail,
+            textAlign: TextAlign.center,
+            style: const TextStyle(
+              fontSize: 11,
+              color: iTantraTheme.textMuted,
+              height: 1.4,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Live view shown while hands-free listening is active.
+class _HandsFreePanel extends StatelessWidget {
+  const _HandsFreePanel({
+    required this.interim,
+    required this.paused,
+    required this.onStop,
+  });
+
+  final String interim;
+  final bool paused;
+  final VoidCallback onStop;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 24),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: iTantraTheme.surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: iTantraTheme.success.withValues(alpha: 0.45),
+        ),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.graphic_eq, size: 40, color: iTantraTheme.success),
+          const SizedBox(height: 8),
+          Text(
+            paused ? 'TRANSMITTING…' : 'LISTENING — SPEAK FREELY',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 12,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 1.2,
+              color: paused ? iTantraTheme.saffron : iTantraTheme.success,
+            ),
+          ),
+          const SizedBox(height: 6),
+          const Text(
+            'A sentence is sent automatically after 3.0 s of silence.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 11,
+              color: iTantraTheme.textMuted,
+            ),
+          ),
+          if (interim.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: iTantraTheme.surfaceLight,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                interim,
+                maxLines: 3,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(
+                  fontSize: 12,
+                  color: iTantraTheme.textPrimary,
+                ),
+              ),
+            ),
+          ],
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            onPressed: onStop,
+            icon: const Icon(Icons.mic_off, size: 16),
+            label: const Text('STOP LISTENING'),
+            style: OutlinedButton.styleFrom(
+              foregroundColor: iTantraTheme.textSecondary,
+              side: const BorderSide(color: iTantraTheme.border),
+            ),
+          ),
+        ],
       ),
     );
   }

@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart' as geo;
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/emergency_service.dart';
@@ -16,6 +18,7 @@ import '../ml/tts_model_downloader.dart';
 import '../net/mesh_transport.dart';
 import '../net/store_forward.dart';
 import '../net/transport.dart';
+import 'app_settings.dart';
 
 /// ── Phase Enum (ARCHITECTURE.md §3) ─────────────────────────────
 
@@ -47,6 +50,19 @@ class LogEntry {
   /// emergency-priority message.
   final bool sos;
 
+  /// Duration of the speech that produced this message, in ms.
+  final int? audioMs;
+
+  /// Recognizer time for this message, in ms (decode only, not the hold).
+  final int? decodeMs;
+
+  /// Real-time factor: [decodeMs] / [audioMs]. Below 1.0 means the recognizer
+  /// ran faster than real time, which is the number an evaluation wants.
+  final double? rtf;
+
+  /// Name the sender transmitted, if any.
+  final String? senderName;
+
   const LogEntry({
     required this.id,
     required this.timestamp,
@@ -62,7 +78,14 @@ class LogEntry {
     this.lon,
     this.error,
     this.sos = false,
+    this.audioMs,
+    this.decodeMs,
+    this.rtf,
+    this.senderName,
   });
+
+  /// Whether this entry carries a position worth plotting.
+  bool get hasPosition => lat != null && lon != null;
 
   Map<String, dynamic> toJson() => {
         'id': id,
@@ -79,6 +102,10 @@ class LogEntry {
         'lon': lon,
         'error': error,
         'sos': sos,
+        'audioMs': audioMs,
+        'decodeMs': decodeMs,
+        'rtf': rtf,
+        'name': senderName,
       };
 
   factory LogEntry.fromJson(Map<String, dynamic> j) => LogEntry(
@@ -99,6 +126,10 @@ class LogEntry {
         lon: (j['lon'] as num?)?.toDouble(),
         error: j['error'] as String?,
         sos: j['sos'] as bool? ?? false,
+        audioMs: j['audioMs'] as int?,
+        decodeMs: j['decodeMs'] as int?,
+        rtf: (j['rtf'] as num?)?.toDouble(),
+        senderName: j['name'] as String?,
       );
 }
 
@@ -114,17 +145,25 @@ class TransceiverController extends ChangeNotifier {
   final Transport transport;
   final TranslationEngine translator;
 
+  /// Shared, persisted user preferences.
+  final AppSettings settings;
+
   late final StoreForwardQueue storeForward;
 
   TransceiverController({
     required this.stt,
     required this.tts,
     required this.transport,
+    required this.settings,
     TranslationEngine? translator,
   }) : translator = translator ?? TranslationEngine() {
     storeForward = StoreForwardQueue(transport);
+    tts.speechRate = settings.speechRate;
     _listenInbound();
-    _loadPrefs();
+    _listenSilentSos();
+
+    // React to preference changes (speech rate, mode, role, hardware toggle).
+    settings.addListener(_onSettingsChanged);
 
     // Mirror radio-state changes into the UI. The mesh emits only when the
     // link signature actually changes, so this does not cause rebuild churn.
@@ -142,12 +181,7 @@ class TransceiverController extends ChangeNotifier {
   }
 
   StreamSubscription<void>? _linkSubscription;
-
-  Future<void> _loadPrefs() async {
-    final prefs = await SharedPreferences.getInstance();
-    _gpsEnabled = prefs.getBool('gpsEnabled') ?? true;
-    notifyListeners();
-  }
+  StreamSubscription<void>? _silentSosSubscription;
 
   /// Auto-start the radios in the background.
   Future<void> _startMeshOnInit() async {
@@ -162,6 +196,26 @@ class TransceiverController extends ChangeNotifier {
     // lets an SOS arrive when the app looks closed. Started regardless of the
     // radio result: it also keeps the radio retry loop running.
     await enableStandby();
+
+    // Hands-free listens continuously, so it only makes sense once the radios
+    // (and therefore the mic pipeline) are up.
+    if (settings.isHandsFree && settings.canTransmit) {
+      await startHandsFree();
+    }
+  }
+
+  /// Apply preference changes that the controller owns.
+  void _onSettingsChanged() {
+    tts.speechRate = settings.speechRate;
+    unawaited(EmergencyService.setSilentSosEnabled(settings.silentSosEnabled));
+
+    final wantsHandsFree = settings.isHandsFree && settings.canTransmit;
+    if (wantsHandsFree && !_handsFree) {
+      unawaited(startHandsFree());
+    } else if (!wantsHandsFree && _handsFree) {
+      unawaited(stopHandsFree());
+    }
+    notifyListeners();
   }
 
   /// Live radio state (BLE + Wi-Fi Direct), for the app-bar badge.
@@ -191,18 +245,20 @@ class TransceiverController extends ChangeNotifier {
   TransceiverPhase _phase = TransceiverPhase.idle;
   TransceiverPhase get phase => _phase;
 
-  bool _gpsEnabled = true; // Default on — users expect GPS to work out of the box.
-  bool get gpsEnabled => _gpsEnabled;
-  set gpsEnabled(bool v) {
-    _gpsEnabled = v;
-    notifyListeners();
-    // Persist preference.
-    SharedPreferences.getInstance().then((p) => p.setBool('gpsEnabled', v));
-  }
+  /// Whether outgoing packets are GPS-stamped (delegates to [settings]).
+  bool get gpsEnabled => settings.gpsEnabled;
+  set gpsEnabled(bool v) => settings.gpsEnabled = v;
+
+  /// Whether the microphone may be used on this device.
+  bool get micEnabled => settings.canTransmit;
+
+  /// Whether incoming messages may be spoken on this device.
+  bool get playbackEnabled => settings.canReceive;
 
   Lang _senderLang = kHindi;
   Lang get senderLang => _senderLang;
   set senderLang(Lang v) {
+    if (v == _senderLang) return;
     _senderLang = v;
     notifyListeners();
   }
@@ -210,6 +266,7 @@ class TransceiverController extends ChangeNotifier {
   Lang _receiverLang = kHindi;
   Lang get receiverLang => _receiverLang;
   set receiverLang(Lang v) {
+    if (v == _receiverLang) return;
     _receiverLang = v;
     notifyListeners();
     // Prepare the neural voice for the new receiver language.
@@ -245,6 +302,8 @@ class TransceiverController extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ── Alarm state ────────────────────────────────────────────────
+
   bool _alarmActive = false;
   bool get alarmActive => _alarmActive;
 
@@ -263,14 +322,40 @@ class TransceiverController extends ChangeNotifier {
   bool _alarmIsSos = false;
   bool get alarmIsSos => _alarmIsSos;
 
+  /// Who raised the alarm, when the sender transmitted a name.
+  String? _alarmSender;
+  String? get alarmSender => _alarmSender;
+
+  /// Position attached to the alarm, for the offline map.
+  double? _alarmLat;
+  double? get alarmLat => _alarmLat;
+  double? _alarmLon;
+  double? get alarmLon => _alarmLon;
+
+  /// Whether the current alarm carries a plottable position.
+  bool get alarmHasPosition => _alarmLat != null && _alarmLon != null;
+
   /// When the current alarm started, used to ignore stale auto-clear timers
   /// when a second alert arrives while one is already showing.
   DateTime? _alarmStartedAt;
   Timer? _alarmTimer;
 
+  /// How long a routine emergency-keyword alert stays on screen.
+  ///
+  /// Deliberately short: it is an attention grabber, not a mode. The user can
+  /// still read the message in the packet log after it clears.
+  static const Duration kEmergencyAlertSeconds = Duration(seconds: 5);
+
+  /// How long an explicit SOS stays up. Longer than a keyword alert because an
+  /// SOS is the thing everyone needs to see, and it is re-raised by repeats.
+  static const Duration kSosAlertSeconds = Duration(seconds: 20);
+
   /// Number of devices the last SOS was handed to.
   int _lastSosFanout = 0;
   int get lastSosFanout => _lastSosFanout;
+
+  DateTime? _lastSosSentAt;
+  DateTime? get lastSosSentAt => _lastSosSentAt;
 
   final List<LogEntry> _log = [];
   List<LogEntry> get log => List.unmodifiable(_log);
@@ -287,7 +372,8 @@ class TransceiverController extends ChangeNotifier {
   String get modelsDownloadStatus => _modelsDownloadStatus;
 
   /// Whether the sender language models are ready for offline STT.
-  bool get senderModelsReady => stt.isReady && stt.currentLocale == _senderLang.code;
+  bool get senderModelsReady =>
+      stt.isReady && stt.currentLocale == _senderLang.code;
 
   // ── TTS Model Download State ──────────────────────────────────
 
@@ -311,7 +397,7 @@ class TransceiverController extends ChangeNotifier {
   Future<bool> _ensureTtsModels(Lang lang) async {
     // Already loaded for THIS language?
     if (tts.isNeuralReadyFor(lang)) return true;
-    // No neural model exists for this language (e.g. Odia) — platform TTS.
+    // No neural model exists for this language — platform TTS handles it.
     if (!TtsModelDownloader.hasNeuralModel(lang)) return false;
     if (_ttsDownloading) return false;
 
@@ -348,42 +434,12 @@ class TransceiverController extends ChangeNotifier {
   }
 
   /// Download models for the current sender language.
-  Future<void> downloadSenderModels() async {
-    if (_modelsDownloading) return;
-
-    _modelsDownloading = true;
-    _modelsDownloadProgress = 0.0;
-    _modelsDownloadStatus = 'Preparing ${_senderLang.name} models…';
-    notifyListeners();
-
-    final success = await stt.prepareModels(
-      _senderLang,
-      onProgress: (progress) {
-        _modelsDownloadProgress = progress;
-        _modelsDownloadStatus =
-            'Downloading ${_senderLang.name} models… ${(progress * 100).toInt()}%';
-        notifyListeners();
-      },
-    );
-
-    _modelsDownloading = false;
-    if (success) {
-      // Auto-initialize the recognizer with the new models.
-      final initErr = await stt.init(_senderLang);
-      if (initErr == null) {
-        _modelsDownloadStatus = '${_senderLang.name} models ready ✓';
-      } else {
-        // Show the real sherpa-onnx error to the user.
-        _modelsDownloadStatus = 'Load failed: $initErr';
-      }
-    } else {
-      _modelsDownloadStatus = 'Download failed — check connection';
-    }
-    notifyListeners();
-  }
+  Future<void> downloadSenderModels() => _downloadModels(_senderLang);
 
   /// Pre-download models for a language in the background.
-  Future<void> predownloadModels(Lang lang) async {
+  Future<void> predownloadModels(Lang lang) => _downloadModels(lang);
+
+  Future<void> _downloadModels(Lang lang) async {
     if (_modelsDownloading) return;
 
     _modelsDownloading = true;
@@ -404,11 +460,9 @@ class TransceiverController extends ChangeNotifier {
     _modelsDownloading = false;
     if (success) {
       final initErr = await stt.init(lang);
-      if (initErr == null) {
-        _modelsDownloadStatus = '${lang.name} models ready ✓';
-      } else {
-        _modelsDownloadStatus = 'Load failed: $initErr';
-      }
+      _modelsDownloadStatus = initErr == null
+          ? '${lang.name} models ready ✓'
+          : 'Load failed: $initErr';
     } else {
       _modelsDownloadStatus = 'Download failed — check connection';
     }
@@ -442,16 +496,119 @@ class TransceiverController extends ChangeNotifier {
   /// Whether a frame can reach another device right now.
   bool get hasReachablePeer => linkStats.hasPeers;
 
+  // ── Hardware (silent) SOS ─────────────────────────────────────
+
+  void _listenSilentSos() {
+    EmergencyService.initSilentSosHandler();
+    _silentSosSubscription =
+        EmergencyService.silentSosTriggered.listen((_) {
+      if (!settings.silentSosEnabled) return;
+      if (_sosInFlight) return;
+      _statusMessage = 'Hardware SOS trigger — sending…';
+      notifyListeners();
+      unawaited(sendSos(note: 'hardware button'));
+    });
+    unawaited(EmergencyService.setSilentSosEnabled(settings.silentSosEnabled));
+  }
+
+  // ── Operation mode ────────────────────────────────────────────
+
+  bool _handsFree = false;
+
+  /// Whether the mic is currently open in hands-free (phone) mode.
+  bool get handsFreeActive => _handsFree;
+
+  /// Open the mic and stream every silence-delimited sentence automatically.
+  ///
+  /// Returns `false` when the role forbids transmitting or the mic could not
+  /// be opened.
+  Future<bool> startHandsFree() async {
+    if (_handsFree) return true;
+    if (!settings.canTransmit) {
+      _statusMessage =
+          'Receiver-only (TTS) mode: microphone transmission is disabled';
+      notifyListeners();
+      return false;
+    }
+    if (_phase == TransceiverPhase.processing) return false;
+
+    _statusMessage = null;
+    _interimText = '';
+    // The phase deliberately stays `idle` while hands-free is listening.
+    // `recording` means "the user is holding the channel", which gates the SOS
+    // button, the text field and inbound playback in the UI; hands-free must
+    // not lock any of those. [handsFreeActive] is what drives the listening
+    // indicator instead.
+    notifyListeners();
+
+    if (!stt.isReady || stt.currentLocale != _senderLang.code) {
+      unawaited(downloadSenderModels());
+      _statusMessage = 'Preparing ${_senderLang.name} speech model — '
+          'hands-free transcription improves when it finishes';
+      notifyListeners();
+    }
+
+    await stt.start(
+      localeId: _senderLang.code,
+      continuous: true,
+      onResult: (text, isFinal) {
+        // Live preview while the sentence is still forming.
+        if (!isFinal) {
+          _interimText = text;
+          notifyListeners();
+          return;
+        }
+        // VAD saw its silence window: this sentence is done. Send it.
+        _interimText = '';
+        _enqueueTranscript(text);
+      },
+    );
+
+    if (!stt.isListening) {
+      _statusMessage = 'Microphone not available — check permissions';
+      notifyListeners();
+      return false;
+    }
+
+    _handsFree = true;
+    notifyListeners();
+    return true;
+  }
+
+  /// Close the hands-free microphone.
+  Future<void> stopHandsFree() async {
+    if (!_handsFree) return;
+    _handsFree = false;
+    notifyListeners();
+    // Flush anything the VAD was still holding so a half-finished sentence is
+    // not silently discarded when the mode is switched off.
+    final tail = await stt.stop();
+    _phase = TransceiverPhase.idle;
+    _interimText = '';
+    if (tail.trim().isNotEmpty) await _enqueueTranscript(tail.trim());
+    notifyListeners();
+  }
+
   // ── PTT Controls ───────────────────────────────────────────────
 
   int? _sttStartMs;
 
   bool get isRecording => _phase == TransceiverPhase.recording;
+
+  /// Whether the mic is live, in either mode. Drives the "listening" indicator.
+  bool get isListening => _handsFree || _phase == TransceiverPhase.recording;
+
   bool get isProcessing => _phase == TransceiverPhase.processing;
 
   /// Begin recording on PTT press or tap.
   Future<void> startPtt() async {
     if (_phase != TransceiverPhase.idle) return;
+    if (!settings.canTransmit) {
+      _statusMessage =
+          'Receiver-only (TTS) mode: microphone transmission is disabled';
+      notifyListeners();
+      return;
+    }
 
     _statusMessage = null;
     _phase = TransceiverPhase.recording;
@@ -478,7 +635,7 @@ class TransceiverController extends ChangeNotifier {
         _interimText = text;
         notifyListeners();
         if (isFinal && text.trim().isNotEmpty) {
-          _processTranscript(text);
+          _enqueueTranscript(text);
         }
       },
     );
@@ -519,7 +676,7 @@ class TransceiverController extends ChangeNotifier {
     final text = (flushed.trim().isNotEmpty ? flushed : _interimText).trim();
 
     if (text.isNotEmpty) {
-      await _processTranscript(text);
+      await _enqueueTranscript(text);
     } else {
       _phase = TransceiverPhase.idle;
       _interimText = '';
@@ -534,10 +691,28 @@ class TransceiverController extends ChangeNotifier {
     }
   }
 
+  /// Serialises the transmit path.
+  ///
+  /// Hands-free mode can finish a second sentence while the first is still
+  /// being encoded and sent. Queueing here means a sentence is never dropped
+  /// and two frames are never built from interleaved state.
+  Future<void> _txChain = Future<void>.value();
+
+  Future<void> _enqueueTranscript(String text) {
+    final next = _txChain.then((_) => _processTranscript(text));
+    // Keep the chain healthy even if one send throws.
+    _txChain = next.catchError((Object e) {
+      debugPrint('[TransceiverController] send failed: $e');
+    });
+    return next;
+  }
+
   /// Process the final transcript and transmit.
   Future<void> _processTranscript(String text) async {
     if (text.trim().isEmpty) {
-      _phase = TransceiverPhase.idle;
+      if (_phase == TransceiverPhase.processing) {
+        _phase = TransceiverPhase.idle;
+      }
       _interimText = '';
       notifyListeners();
       return;
@@ -548,10 +723,15 @@ class TransceiverController extends ChangeNotifier {
     notifyListeners();
 
     final e2eStart = DateTime.now().millisecondsSinceEpoch;
-    final sttMs = _sttStartMs != null
-        ? e2eStart - _sttStartMs!
-        : 0;
+    final sttMs = _sttStartMs != null ? e2eStart - _sttStartMs! : 0;
     _sttStartMs = null;
+
+    // ── Speech / decode timing (RTF benchmark) ──
+    final audioMs = stt.lastUtteranceMs > 0 ? stt.lastUtteranceMs : null;
+    final decodeMs = stt.lastDecodeMs > 0 ? stt.lastDecodeMs : null;
+    final rtf = (audioMs != null && audioMs > 0 && decodeMs != null)
+        ? decodeMs / audioMs
+        : null;
 
     // ── Distress detection (ADDITIONAL_FEATURES.md §1) ──
     final isDistress = detectDistress(text, _senderLang.iso639);
@@ -562,19 +742,16 @@ class TransceiverController extends ChangeNotifier {
 
     // ── Encode ──
     _sequenceId++;
-    final flags = PayloadFlags(
-      hasGps: lat != null && lon != null,
-    );
-
     final packet = IbfPacket(
       type: PacketType.pttVoice,
       priority: priority,
       language: _senderLang,
       sequenceId: _sequenceId,
       text: text,
-      flags: flags,
       latitude: lat,
       longitude: lon,
+      // Username travels with every frame so the receiver knows who spoke.
+      senderName: settings.username.isEmpty ? null : settings.username,
     );
 
     final frame = encodeIbfs(packet);
@@ -603,6 +780,10 @@ class TransceiverController extends ChangeNotifier {
         sttMs: sttMs,
         lat: lat,
         lon: lon,
+        audioMs: audioMs,
+        decodeMs: decodeMs,
+        rtf: rtf,
+        senderName: settings.username.isEmpty ? null : settings.username,
         error: 'Not delivered — $reason\nQueued '
             '(${storeForward.pendingCount}) for automatic retry',
       ));
@@ -626,6 +807,10 @@ class TransceiverController extends ChangeNotifier {
       e2eMs: e2eMs,
       lat: lat,
       lon: lon,
+      audioMs: audioMs,
+      decodeMs: decodeMs,
+      rtf: rtf,
+      senderName: settings.username.isEmpty ? null : settings.username,
     ));
 
     _phase = TransceiverPhase.idle;
@@ -640,7 +825,7 @@ class TransceiverController extends ChangeNotifier {
   Future<(double?, double?)> _stampGps({
     Duration timeout = const Duration(seconds: 5),
   }) async {
-    if (!_gpsEnabled) return (null, null);
+    if (!settings.gpsEnabled) return (null, null);
     try {
       final pos = await geo.Geolocator.getCurrentPosition(
         desiredAccuracy: geo.LocationAccuracy.low,
@@ -676,9 +861,6 @@ class TransceiverController extends ChangeNotifier {
 
   bool _sosInFlight = false;
   bool get sosInFlight => _sosInFlight;
-
-  DateTime? _lastSosSentAt;
-  DateTime? get lastSosSentAt => _lastSosSentAt;
 
   /// Re-read native emergency state (called when the app resumes, so status
   /// updates after the user returns from a settings screen).
@@ -723,6 +905,10 @@ class TransceiverController extends ChangeNotifier {
   /// [PacketType.silentSos], which every receiver treats as "raise the alarm",
   /// including receivers whose app is not on screen.
   ///
+  /// The pre-set medical telemetry from Settings is appended to the message so
+  /// responders receive blood group and emergency contacts in the same packet
+  /// rather than having to ask for them.
+  ///
   /// Returns `true` when at least one device was reached. When nothing is in
   /// range the frame is queued and re-sent automatically on reconnect.
   Future<bool> sendSos({String? note}) async {
@@ -737,9 +923,12 @@ class TransceiverController extends ChangeNotifier {
       );
 
       _sequenceId++;
-      final text = (note == null || note.trim().isEmpty)
-          ? 'SOS'
-          : 'SOS — ${note.trim()}';
+      final buffer = StringBuffer('SOS');
+      final trimmedNote = note?.trim() ?? '';
+      if (trimmedNote.isNotEmpty) buffer.write(' — $trimmedNote');
+      final medical = settings.medicalSummary;
+      if (medical != null) buffer.write(' | $medical');
+      final text = buffer.toString();
 
       final packet = IbfPacket(
         type: PacketType.silentSos,
@@ -747,9 +936,9 @@ class TransceiverController extends ChangeNotifier {
         language: _senderLang,
         sequenceId: _sequenceId,
         text: text,
-        flags: PayloadFlags(hasGps: lat != null && lon != null),
         latitude: lat,
         longitude: lon,
+        senderName: settings.username.isEmpty ? null : settings.username,
       );
       final frame = encodeIbfs(packet);
 
@@ -773,6 +962,7 @@ class TransceiverController extends ChangeNotifier {
           lat: lat,
           lon: lon,
           sos: true,
+          senderName: settings.username.isEmpty ? null : settings.username,
           error: 'Not delivered — $reason\nQueued '
               '(${storeForward.pendingCount}) for automatic retry',
         ));
@@ -781,9 +971,8 @@ class TransceiverController extends ChangeNotifier {
 
       _lastSosFanout = fanout;
       _lastSosSentAt = DateTime.now();
-      _statusMessage = fanout == 1
-          ? 'SOS sent to 1 device'
-          : 'SOS sent to $fanout devices';
+      _statusMessage =
+          fanout == 1 ? 'SOS sent to 1 device' : 'SOS sent to $fanout devices';
       _addLog(LogEntry(
         id: _sequenceId,
         timestamp: DateTime.now(),
@@ -794,6 +983,7 @@ class TransceiverController extends ChangeNotifier {
         lat: lat,
         lon: lon,
         sos: true,
+        senderName: settings.username.isEmpty ? null : settings.username,
       ));
       return fanout > 0;
     } finally {
@@ -815,6 +1005,9 @@ class TransceiverController extends ChangeNotifier {
     _alarmIsSos = packet.isSos;
     _alarmLabel = packet.alertLabel;
     _alarmText = displayText;
+    _alarmSender = packet.senderName;
+    _alarmLat = packet.latitude;
+    _alarmLon = packet.longitude;
     notifyListeners();
 
     // Native alert first: a loud alarm on the alarm stream, a repeating
@@ -823,12 +1016,12 @@ class TransceiverController extends ChangeNotifier {
     // Do Not Disturb.
     unawaited(EmergencyService.raiseAlarm(
       text: displayText,
-      from: packet.alertLabel,
+      from: packet.senderName ?? packet.alertLabel,
     ));
 
     _alarmTimer?.cancel();
     _alarmTimer = Timer(
-      packet.isSos ? const Duration(seconds: 20) : const Duration(seconds: 9),
+      packet.isSos ? kSosAlertSeconds : kEmergencyAlertSeconds,
       () {
         // Ignore a stale timer if a newer alert replaced this one.
         if (_alarmStartedAt != startedAt) return;
@@ -872,45 +1065,89 @@ class TransceiverController extends ChangeNotifier {
       return;
     }
 
-    // ── Half-duplex (PTT) discipline ──
-    // A walkie-talkie is half duplex: while this device is recording,
-    // processing or transmitting, the incoming voice is logged but NOT played,
-    // otherwise the speaker would be picked up by our own microphone and
-    // immediately re-transmitted.
-    final bool busyTransmitting = _phase != TransceiverPhase.idle;
+    // ── Sender identity (feature: username over iBFS) ──
+    // `displayText` already carries the "[Name] " prefix when the sender
+    // transmitted one, so both the log and the alarm show who spoke.
+    final baseText = packet.displayText;
+
+    // ── Half-duplex discipline ──
+    // Push-to-talk is half duplex: while this device is recording, processing
+    // or transmitting, the incoming voice is logged but NOT played, otherwise
+    // the speaker would be picked up by our own microphone and immediately
+    // re-transmitted.
+    //
+    // Hands-free is deliberately excluded: there is no "on air" state to
+    // suppress against, and silencing every incoming message while the mic is
+    // open would turn the phone mode into a one-way channel. The feedback loop
+    // is broken at the other end instead — capture is muted for exactly as long
+    // as the incoming voice is playing.
+    final bool busyTransmitting = !_handsFree &&
+        (_phase == TransceiverPhase.recording ||
+            _phase == TransceiverPhase.processing ||
+            _phase == TransceiverPhase.transmitting);
 
     // ── Cross-lingual translation + neural TTS (ARCHITECTURE.md §2.4) ──
     // If the packet language differs from our receiver language, translate
     // the text on-device, then speak the translation with the receiver
     // language's neural voice.
     final bool sameLang = packet.language.iso639 == _receiverLang.iso639;
-    String displayText = packet.text;
+    String displayText = baseText;
     String spokenText = packet.text;
     Lang ttsLang = packet.language;
+    String? translationNote;
 
     if (!sameLang) {
-      // Ensure the receiver's voice is available (downloads once, ~114 MB).
-      // Skipped while we are on air so a download never delays the next packet.
-      if (!busyTransmitting) await _ensureTtsModels(_receiverLang);
+      if (!settings.translationEnabled) {
+        translationNote = 'Translation off — showing original text';
+      } else if (!TranslationEngine.supportsAll([packet.language, _receiverLang])) {
+        // ML Kit has no model for one of the two languages (e.g. Malayalam,
+        // Odia, Punjabi and every north-eastern language). Say which side is
+        // missing a model instead of silently showing the original text.
+        final missing = TranslationEngine.isSupported(packet.language)
+            ? _receiverLang.name
+            : packet.language.name;
+        translationNote =
+            'No offline model for $missing — showing original text';
+      } else {
+        // Ensure the receiver's voice is available (downloads once). Skipped
+        // while we are on air so a download never delays the next packet.
+        if (!busyTransmitting) await _ensureTtsModels(_receiverLang);
 
-      final translated = await translator.translate(
-        packet.text,
-        packet.language,
-        _receiverLang,
-      );
-      if (translated != null) {
-        displayText = '${packet.text} → $translated';
-        spokenText = translated;
-        ttsLang = _receiverLang;
+        // Never blocks: returns false while the model downloads in the
+        // background, and this message falls back to the original text.
+        final ready = await translator.ensureModels(
+          packet.language,
+          _receiverLang,
+        );
+        if (ready) {
+          final translated = await translator.translate(
+            packet.text,
+            packet.language,
+            _receiverLang,
+          );
+          if (translated != null) {
+            displayText = '$baseText → $translated';
+            spokenText = translated;
+            ttsLang = _receiverLang;
+          } else {
+            translationNote = 'Translation failed — showing original text';
+          }
+        } else {
+          translationNote =
+              'Translation model downloading — this message stays in '
+              '${packet.language.name}, the next one will be translated';
+        }
       }
-      // Translation unavailable: fall back to showing the original text.
     } else if (!busyTransmitting) {
       // Same language: still make sure the neural voice is ready.
       await _ensureTtsModels(_receiverLang);
     }
 
     final int? ttsMs;
-    if (busyTransmitting) {
+    if (!settings.canReceive) {
+      // Sender-only (STT) role: log it, stay silent.
+      ttsMs = null;
+    } else if (busyTransmitting) {
       // Received while we were on air — show it, stay silent.
       ttsMs = null;
     } else {
@@ -919,9 +1156,18 @@ class TransceiverController extends ChangeNotifier {
       if (packet.isSos) {
         await Future<void>.delayed(const Duration(milliseconds: 1500));
       }
+
+      // Hands-free keeps the mic open while we speak, so our own voice would
+      // be captured and sent back. Mute capture for the duration.
+      final counterMute = _handsFree;
+      if (counterMute) stt.muteCapture(true);
       final ttsStart = DateTime.now().millisecondsSinceEpoch;
-      await tts.speak(spokenText,
-          lang: ttsLang, emergency: packet.raisesAlarm);
+      try {
+        await tts.speak(spokenText,
+            lang: ttsLang, emergency: packet.raisesAlarm);
+      } finally {
+        if (counterMute) stt.muteCapture(false);
+      }
       ttsMs = DateTime.now().millisecondsSinceEpoch - ttsStart;
     }
 
@@ -941,6 +1187,8 @@ class TransceiverController extends ChangeNotifier {
       lat: packet.latitude,
       lon: packet.longitude,
       sos: packet.isSos,
+      senderName: packet.senderName,
+      error: translationNote,
     ));
 
     // ── Emergency alarm override (ARCHITECTURE.md §2.3) ──
@@ -957,6 +1205,7 @@ class TransceiverController extends ChangeNotifier {
     _alarmTimer = null;
     _alarmActive = false;
     _alarmText = null;
+    _alarmSender = null;
     notifyListeners();
     unawaited(EmergencyService.clearAlarm());
   }
@@ -997,7 +1246,7 @@ class TransceiverController extends ChangeNotifier {
 
     _typedText = '';
     notifyListeners();
-    await _processTranscript(text.trim());
+    await _enqueueTranscript(text.trim());
   }
 
   /// Number of queued messages waiting for peer reconnection.
@@ -1012,14 +1261,103 @@ class TransceiverController extends ChangeNotifier {
     await prefs.remove('itantra_log');
   }
 
+  // ── Cache maintenance (Settings) ───────────────────────────────
+
+  /// Delete cached audio clips, the stored message log and the pending
+  /// store-and-forward queue.
+  ///
+  /// Downloaded AI models are deliberately **kept**: re-downloading a 150 MB
+  /// speech model in a disaster zone is exactly what this app exists to avoid.
+  /// A separate switch in Settings removes translation models explicitly.
+  Future<CacheClearReport> clearCaches({
+    bool dropTranslationModels = false,
+    bool dropSpeechModels = false,
+  }) async {
+    var clipBytes = 0;
+    var clipCount = 0;
+
+    try {
+      final tmp = await getTemporaryDirectory();
+      await for (final entity in tmp.list()) {
+        if (entity is! File) continue;
+        final name = entity.uri.pathSegments.last;
+        if (!name.startsWith('itantra_tts_')) continue;
+        try {
+          clipBytes += await entity.length();
+          await entity.delete();
+          clipCount++;
+        } catch (_) {
+          // A clip still being played cannot be removed; it will be
+          // overwritten on the next synthesis.
+        }
+      }
+    } catch (e) {
+      debugPrint('[TransceiverController] cache cleanup: $e');
+    }
+
+    final logEntries = _log.length;
+    await clearLog();
+    storeForward.clear();
+
+    if (dropTranslationModels) {
+      await translator.purgeModels();
+    }
+
+    if (dropSpeechModels) {
+      // Drop downloaded STT/TTS model files; they re-download on demand.
+      try {
+        final docs = await getApplicationDocumentsDirectory();
+        final modelsDir = Directory('${docs.path}/models');
+        if (await modelsDir.exists()) {
+          await modelsDir.delete(recursive: true);
+        }
+      } catch (e) {
+        debugPrint('[TransceiverController] model purge: $e');
+      }
+    }
+
+    _statusMessage = 'Cleared $clipCount cached clip'
+        '${clipCount == 1 ? '' : 's'} and $logEntries log entries';
+    notifyListeners();
+
+    return CacheClearReport(
+      clipCount: clipCount,
+      clipBytes: clipBytes,
+      logEntries: logEntries,
+    );
+  }
+
   @override
   void dispose() {
+    settings.removeListener(_onSettingsChanged);
     _linkSubscription?.cancel();
+    _silentSosSubscription?.cancel();
     _alarmTimer?.cancel();
     transport.disconnect();
     stt.dispose();
     tts.dispose();
     translator.dispose();
     super.dispose();
+  }
+}
+
+/// Outcome of a cache cleanup, for the Settings snackbar.
+class CacheClearReport {
+  final int clipCount;
+  final int clipBytes;
+  final int logEntries;
+
+  const CacheClearReport({
+    required this.clipCount,
+    required this.clipBytes,
+    required this.logEntries,
+  });
+
+  String get prettySize {
+    if (clipBytes < 1024) return '$clipBytes B';
+    if (clipBytes < 1024 * 1024) {
+      return '${(clipBytes / 1024).toStringAsFixed(1)} KB';
+    }
+    return '${(clipBytes / (1024 * 1024)).toStringAsFixed(1)} MB';
   }
 }

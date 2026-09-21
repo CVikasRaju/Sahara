@@ -24,6 +24,22 @@ class TtsEngine {
   String? _neuralLangIso;
   String? _currentBcp47;
 
+  /// Playback speed multiplier from the Settings screen (0.5–1.5).
+  double _speechRate = 1.0;
+
+  /// The rate currently applied to the platform synthesizer, so a rate change
+  /// is pushed to the engine without reconfiguring the language every time.
+  double? _appliedRate;
+
+  /// User-selected speech rate. Applies to both the neural and platform paths.
+  double get speechRate => _speechRate;
+  set speechRate(double v) {
+    if (v.isNaN || v <= 0) return;
+    _speechRate = v.clamp(0.5, 1.5).toDouble();
+    // Force the next _configurePlatform to re-apply the rate.
+    _appliedRate = null;
+  }
+
   /// Whether the neural VITS engine is active for the current language.
   bool get isNeuralReady => _neural != null;
 
@@ -84,13 +100,17 @@ class TtsEngine {
 
   /// Configure the platform fallback for the given BCP 47 locale.
   Future<void> _configurePlatform(String bcp47) async {
-    if (_currentBcp47 == bcp47) return;
+    final sameLang = _currentBcp47 == bcp47;
+    if (sameLang && _appliedRate == _speechRate) return;
     try {
-      await _tts.setLanguage(bcp47);
-      await _tts.setSpeechRate(0.9);
+      if (!sameLang) {
+        await _tts.setLanguage(bcp47);
+        _currentBcp47 = bcp47;
+      }
+      await _tts.setSpeechRate(_speechRate);
       await _tts.setVolume(1.0);
       await _tts.setPitch(1.0);
-      _currentBcp47 = bcp47;
+      _appliedRate = _speechRate;
     } catch (_) {
       // Platform TTS unavailable (e.g. no TTS engine installed).
     }
@@ -130,7 +150,8 @@ class TtsEngine {
         final audio = neural.generate(
           text: text,
           sid: 0,
-          speed: emergency ? 1.1 : 1.0,
+          // Emergency speech is nudged faster on top of the user's preference.
+          speed: emergency ? _speechRate * 1.1 : _speechRate,
         );
         if (audio.samples.isNotEmpty) {
           await _playPcm(
@@ -150,7 +171,8 @@ class TtsEngine {
     try {
       if (emergency) {
         await _tts.setVolume(1.0);
-        await _tts.setSpeechRate(1.1); // slightly faster for urgency
+        // Slightly faster for urgency, on top of the user's own rate.
+        await _tts.setSpeechRate(_speechRate * 1.15);
       }
 
       await _tts.speak(text);
@@ -158,7 +180,10 @@ class TtsEngine {
 
       if (emergency) {
         await _tts.setVolume(0.8);
-        await _tts.setSpeechRate(0.9);
+        // Restore the user's rate rather than a hard-coded default, and mark
+        // it unapplied so the next call pushes the correct value.
+        await _tts.setSpeechRate(_speechRate);
+        _appliedRate = null;
       }
     } catch (_) {
       // Platform TTS failed — nothing more we can do.

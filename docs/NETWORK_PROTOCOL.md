@@ -34,26 +34,74 @@ Total fixed overhead: 12 bytes header + 2 bytes CRC = 14 bytes, regardless of pa
 
 ## 3. Language Code Table
 
-| Code | Lang | Code | Lang |
+The header's language field is a **4-bit nibble**, so it can only address 16 values, while iTantra supports the **22 languages of the Eighth Schedule plus English (23)**. The nibble therefore has a dual role:
+
+- `0x0 – 0xE` — a language written **directly** into the nibble (15 slots).
+- `0xF` — an **escape**: the nibble carries `0xF`, the `HasExtLang` flag is set, and the real language ID travels in a one-byte payload extension (§4).
+
+The first ten IDs are **unchanged** from the original 10-language table, so an already-deployed build still interoperates byte-for-byte with this one. The escape is used only by languages added in the expansion.
+
+### Direct IDs (0x0 – 0xE)
+
+| Code | Language | Code | Language |
 |---|---|---|---|
-| 0x0 | Hindi (hi) | 0x5 | Telugu (te) |
-| 0x1 | Gujarati (gu) | 0x6 | Malayalam (ml) |
-| 0x2 | Marathi (mr) | 0x7 | Odia (or) |
-| 0x3 | Kannada (kn) | 0x8 | Bengali (bn) |
-| 0x4 | Tamil (ta) | 0x9 | English (en-IN) |
+| 0x0 | Hindi (hi) | 0x8 | Bengali (bn) |
+| 0x1 | Gujarati (gu) | 0x9 | English (en) |
+| 0x2 | Marathi (mr) | 0xA | Punjabi (pa) |
+| 0x3 | Kannada (kn) | 0xB | Urdu (ur) |
+| 0x4 | Tamil (ta) | 0xC | Assamese (as) |
+| 0x5 | Telugu (te) | 0xD | Nepali (ne) |
+| 0x6 | Malayalam (ml) | 0xE | Konkani (kok) |
+| 0x7 | Odia (or) | | |
+
+### Escaped IDs (nibble `0xF` + extension byte)
+
+| Ext | Language | Ext | Language |
+|---|---|---|---|
+| 0 | Maithili (mai) | 4 | Kashmiri (ks) |
+| 1 | Sanskrit (sa) | 5 | Bodo (brx) |
+| 2 | Sindhi (sd) | 6 | Manipuri (mni) |
+| 3 | Dogri (doi) | 7 | Santali (sat) |
+
+**Unknown IDs are not fatal.** If a receiver cannot resolve a language ID (a newer sender using a language this build does not know), it falls back to English rather than rejecting the frame — the CRC has already proven the bytes are intact, and on a distress channel a readable message beats a discarded one.
+
+### Encoding a language inside the payload
+
+The source-language and extended-language fields each carry the language's **full identity in one byte**:
+
+- `0x00 – 0x0F` — the language's direct wire ID.
+- `0x10 + extId` — an escaped language.
+
+This one-byte form exists because the payload fields have room where the header nibble does not.
 
 ## 4. Extended Payload (Optional Sub-Fields for Differentiator Features)
 
-When Packet Type or a payload-internal flag indicates extended data, the payload begins with a 1-byte flags field before the text:
+Every payload **always** begins with a 1-byte flags field, followed by the extension fields that field advertises, in a fixed order:
 
 ```
-Byte 0 of payload:  [HasGPS:1][HasSourceLang:1][Reserved:6]
-Byte 1-8 (if HasGPS):     lat (float32) + lon (float32)
-Byte 9 (if HasSourceLang): original sender's language code, for translation-relay
-Remaining bytes: UTF-8 text
+Byte 0 of payload:   [HasGPS:1][HasSourceLang:1][HasSenderName:1][HasExtLang:1][Reserved:4]
+                     bit 7    bit 6          bit 5          bit 4
+
+If HasGPS          (bit 7):  lat (float32 BE) + lon (float32 BE)   8 bytes
+If HasSourceLang   (bit 6):  sender's language, 1 byte (§3)         1 byte
+If HasExtLang      (bit 4):  extended language ID, 1 byte (§3)       1 byte
+If HasSenderName   (bit 5):  name length, 1 byte + UTF-8 name      1 + N bytes
+Remaining bytes:             UTF-8 message text
 ```
 
-This keeps the common case (plain text, no extras) at zero overhead beyond the flag byte, while supporting GPS-stamped distress messages and cross-language relay without a second protocol.
+The order is **fixed and normative**, not a convention: the decoder walks the
+payload left to right, consuming exactly the bytes each set flag implies. Only
+the presence of a field is optional, never its position.
+
+This keeps the common case (plain text, no extras) at exactly **one byte** of overhead, while supporting GPS-stamped distress messages, cross-language relay, the 23-language space and sender identity without a second protocol.
+
+### Sender name (`HasSenderName`, bit 5)
+
+Who is speaking, so another operator knows whose voice they are hearing.
+
+- **Max 8 characters**, enforced by the Settings screen and clamped again by the encoder. Eight Devanagari characters are 24 bytes, so the length prefix counts **bytes** while the limit counts **characters**; the encoder therefore also caps the name at 64 bytes to guarantee it can never crowd the message out of a 512-byte payload.
+- The name is a **structured field, not a `"[Name]: message"` text prefix**. A prefix would be fed to the translation model (producing a mangled name in the spoken translation) and would consume bytes on every single message; the structured form costs nothing when no name is set, and lets the receiver render it separately and speak only the message.
+- An empty or whitespace-only name is encoded as *absent* — no length byte, no flag.
 
 ## 5. Reliability
 - **CRC-16 validation**: corrupted frames are silently dropped, not retransmitted automatically at this layer (retransmission is handled at the app layer via ack timeout, not baked into every packet, to keep overhead minimal on distress/emergency packets which favor speed over guaranteed delivery).

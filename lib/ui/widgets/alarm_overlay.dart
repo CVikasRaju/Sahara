@@ -8,6 +8,10 @@ import '../../core/theme.dart';
 /// Non-dismissible — appears on emergency packets, pulses red, forces
 /// screen wake, and auto-clears after [durationSeconds]. The label switches
 /// between SOS and generic EMERGENCY based on how the alert was raised.
+///
+/// A keyword-triggered emergency alert runs for 5 seconds; an explicit SOS is
+/// given a much longer window by the caller, because somebody is asking for
+/// help and the screen should not go back to normal behind their back.
 class AlarmOverlay extends StatefulWidget {
   final int durationSeconds;
 
@@ -20,12 +24,21 @@ class AlarmOverlay extends StatefulWidget {
   /// Whether this is an explicit SOS packet (longer alert window).
   final bool sos;
 
+  /// Name of the device that raised the alarm, when it transmitted one.
+  final String? sender;
+
+  /// Opens the offline map at the distress coordinates. Null when the packet
+  /// carried no GPS fix.
+  final VoidCallback? onViewMap;
+
   const AlarmOverlay({
     super.key,
-    this.durationSeconds = 9,
+    this.durationSeconds = 5,
     this.label = 'EMERGENCY',
     this.text,
     this.sos = false,
+    this.sender,
+    this.onViewMap,
   });
 
   @override
@@ -101,11 +114,14 @@ class _AlarmOverlayState extends State<AlarmOverlay>
                   ),
                   const SizedBox(height: 12),
 
-                  // Subtitle
+                  // Subtitle — names the sender when one was transmitted.
                   Text(
-                    widget.sos
-                        ? 'Emergency SOS signal received'
-                        : 'Emergency signal received',
+                    widget.sender != null && widget.sender!.isNotEmpty
+                        ? '${widget.sos ? 'Emergency SOS' : 'Emergency'} from '
+                            '${widget.sender}'
+                        : widget.sos
+                            ? 'Emergency SOS signal received'
+                            : 'Emergency signal received',
                     style: TextStyle(
                       fontSize: 16,
                       color: Colors.white.withValues(alpha: 0.9),
@@ -139,7 +155,27 @@ class _AlarmOverlayState extends State<AlarmOverlay>
                       ),
                     ),
                   ],
-                  const SizedBox(height: 40),
+                  // Offline map entry point — only when a fix came in.
+                  if (widget.onViewMap != null) ...[
+                    const SizedBox(height: 20),
+                    OutlinedButton.icon(
+                      onPressed: widget.onViewMap,
+                      icon: const Icon(Icons.map_outlined, size: 18),
+                      label: const Text('VIEW POSITION ON MAP'),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.white,
+                        side: BorderSide(
+                          color: Colors.white.withValues(alpha: 0.55),
+                        ),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 18,
+                          vertical: 12,
+                        ),
+                      ),
+                    ),
+                  ],
+
+                  const SizedBox(height: 28),
 
                   // Countdown bar
                   Padding(

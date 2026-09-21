@@ -45,6 +45,59 @@ class SttEngine {
   /// and aborts, preventing a leaked recorder that nobody will stop.
   int _generation = 0;
 
+  /// Trailing silence the VAD must observe before it finalises a sentence.
+  ///
+  /// Push-to-talk uses a short 0.45 s window so releasing the button sends
+  /// quickly; hands-free mode uses 3.0 s so a natural pause does not chop one
+  /// sentence into three packets.
+  double _minSilence = kPttSilenceSeconds;
+
+  /// Default trailing silence for push-to-talk.
+  static const double kPttSilenceSeconds = 0.45;
+
+  /// Trailing silence for hands-free (phone) mode — the competition spec's
+  /// "strictly 3.0 seconds of silence" sentence boundary.
+  static const double kHandsFreeSilenceSeconds = 3.0;
+
+  /// Continuous capture: each finished sentence is emitted as a *final*
+  /// result instead of accumulating into one utterance.
+  bool _continuous = false;
+
+  /// While true, inbound audio is discarded and the VAD is reset.
+  /// Hands-free mode uses this so the phone's own spoken translation is never
+  /// transcribed and re-transmitted — the classic walkie-talkie feedback loop.
+  bool _muted = false;
+
+  /// Length of the most recent decoded speech segment, in ms. Reported to the
+  /// controller so it can compute the real-time factor (RTF = STT ms / audio ms).
+  int _lastUtteranceMs = 0;
+
+  /// Ceiling on the retained session audio (~30 s at 16 kHz). Hands-free mode
+  /// can run for hours; without a bound the buffer would grow forever.
+  static const int _maxSessionSamples = 16000 * 30;
+
+  /// Duration of the most recent speech segment (ms).
+  int get lastUtteranceMs => _lastUtteranceMs;
+
+  /// Wall-clock time spent inside the recognizer, accumulated across the
+  /// current utterance. Used to report a real-time factor.
+  int _decodeAccumMs = 0;
+  int _lastDecodeMs = 0;
+
+  /// Recognizer time for the most recently completed utterance (ms).
+  ///
+  /// This is deliberately *decode* time, not "time since the button went
+  /// down": RTF = decode time / audio duration is the metric that means
+  /// something, whereas button-to-text includes however long the speaker held
+  /// the button and would always look like RTF ≈ 1.
+  int get lastDecodeMs => _lastDecodeMs;
+
+  /// Whether capture is currently muted.
+  bool get isMuted => _muted;
+
+  /// Whether capture is in continuous (hands-free) mode.
+  bool get isContinuous => _continuous;
+
   // ── Model download state ──────────────────────────────────────
   bool _downloading = false;
   double _downloadProgress = 0.0;
@@ -208,8 +261,22 @@ class SttEngine {
   }
 
   /// Initialize the VAD only (no STT model required).
-  Future<bool> initVad() async {
-    if (_vad != null) return true;
+  ///
+  /// [minSilenceDuration] is the trailing silence that closes a sentence, and
+  /// [force] rebuilds the detector when the mode changes it. The detector is
+  /// recreated rather than mutated because sherpa-onnx reads the config at
+  /// construction time.
+  Future<bool> initVad({
+    double minSilenceDuration = kPttSilenceSeconds,
+    bool force = false,
+  }) async {
+    if (_vad != null && !force && _minSilence == minSilenceDuration) return true;
+    if (_vad != null && force) {
+      try {
+        _vad!.free();
+      } catch (_) {}
+      _vad = null;
+    }
     try {
       final vadPath = await _ensureVadModel();
       if (vadPath == null) return false;
@@ -224,7 +291,7 @@ class SttEngine {
         sileroVad: sherpa.SileroVadModelConfig(
           model: vadPath,
           threshold: 0.5,
-          minSilenceDuration: 0.45,
+          minSilenceDuration: minSilenceDuration,
           minSpeechDuration: 0.2,
           windowSize: 512,
           maxSpeechDuration: 20.0,
@@ -239,6 +306,7 @@ class SttEngine {
         config: _vadConfig!,
         bufferSizeInSeconds: 60.0,
       );
+      _minSilence = minSilenceDuration;
       return true;
     } catch (e) {
       debugPrint('[SttEngine] VAD init failed: $e');
@@ -325,11 +393,25 @@ class SttEngine {
   /// with Silero VAD, and runs the offline recognizer. Live transcripts stream
   /// to [onResult] while the button is held; [stop] flushes the trailing segment
   /// so short utterances are never lost.
+  /// [continuous] selects hands-free behaviour: every VAD-delimited sentence is
+  /// emitted as a final result and the recorder keeps running, rather than
+  /// accumulating one utterance for the whole hold.
   Future<void> start({
     required String localeId,
     required SttResultCallback onResult,
+    bool continuous = false,
   }) async {
     final gen = ++_generation;
+    _continuous = continuous;
+    _muted = false;
+
+    // Hands-free needs a much longer silence window than push-to-talk.
+    final wantedSilence = continuous
+        ? kHandsFreeSilenceSeconds
+        : kPttSilenceSeconds;
+    if (_vad != null && _minSilence != wantedSilence) {
+      await initVad(minSilenceDuration: wantedSilence, force: true);
+    }
 
     final lang = kLanguages.firstWhere(
       (l) => l.code == localeId,
@@ -359,6 +441,9 @@ class SttEngine {
     }
 
     _utterance = '';
+    _lastUtteranceMs = 0;
+    _decodeAccumMs = 0;
+    _lastDecodeMs = 0;
     _sessionAudioBuffer.clear();
 
     Stream<Uint8List> stream;
@@ -394,8 +479,11 @@ class SttEngine {
     );
 
     // 2. Ensure models are initialized in background
-    if (_vad == null) {
-      await initVad();
+    if (_vad == null || _minSilence != wantedSilence) {
+      await initVad(
+        minSilenceDuration: wantedSilence,
+        force: _vad != null,
+      );
     }
 
     if (!_initialized || _currentLocale != localeId) {
@@ -415,9 +503,30 @@ class SttEngine {
     }
   }
 
+  /// Mute or unmute microphone capture.
+  ///
+  /// Hands-free mode speaks the incoming translation through the same device
+  /// that is listening, so without this the neural voice would be recognised
+  /// as speech and bounced straight back to the peer. Muting drops the audio
+  /// and resets the detector so half a word does not survive the gap.
+  void muteCapture(bool muted) {
+    if (muted == _muted) return;
+    _muted = muted;
+    if (muted) {
+      _sessionAudioBuffer.clear();
+      _noVadBuffer.clear();
+      _utterance = '';
+      try {
+        _vad?.clear();
+      } catch (_) {}
+    }
+  }
+
   /// Process a chunk of PCM audio through the VAD + recognizer.
   void _processAudio(Uint8List pcmData, SttResultCallback onResult) {
     if (pcmData.isEmpty) return;
+    // Our own spoken translation is currently playing — drop the audio.
+    if (_muted) return;
     Float32List float32Data;
     try {
       float32Data = _pcm16ToFloat32(pcmData);
@@ -431,6 +540,13 @@ class SttEngine {
     }
     if (float32Data.isEmpty) return;
     _sessionAudioBuffer.addAll(float32Data);
+    // Bound retention so a hands-free session cannot grow without limit.
+    if (_sessionAudioBuffer.length > _maxSessionSamples) {
+      _sessionAudioBuffer.removeRange(
+        0,
+        _sessionAudioBuffer.length - _maxSessionSamples,
+      );
+    }
     final vad = _vad;
 
     try {
@@ -441,10 +557,22 @@ class SttEngine {
           if (segment.samples.isNotEmpty) {
             final text = _recognize(segment.samples);
             if (text.isNotEmpty) {
-              _utterance =
-                  _utterance.isEmpty ? text : '$_utterance $text';
-              // Live preview while the button is still held.
-              onResult(_utterance, false);
+              _lastUtteranceMs =
+                  (segment.samples.length * 1000 / 16000).round();
+              if (_continuous) {
+                // Hands-free: the silence boundary closed this sentence, so
+                // send it now and start the next one clean.
+                _lastDecodeMs = _decodeAccumMs;
+                _decodeAccumMs = 0;
+                onResult(text, true);
+                _utterance = '';
+                _sessionAudioBuffer.clear();
+              } else {
+                _utterance =
+                    _utterance.isEmpty ? text : '$_utterance $text';
+                // Live preview while the button is still held.
+                onResult(_utterance, false);
+              }
             }
           }
           vad.pop();
@@ -454,10 +582,19 @@ class SttEngine {
         _noVadBuffer.addAll(float32Data);
         // Decode roughly every 2 seconds for live preview.
         if (_noVadBuffer.length >= 32000) {
-          final text = _recognize(Float32List.fromList(_noVadBuffer));
+          final samples = Float32List.fromList(_noVadBuffer);
+          final text = _recognize(samples);
           if (text.isNotEmpty) {
-            _utterance = _utterance.isEmpty ? text : '$_utterance $text';
-            onResult(_utterance, false);
+            _lastUtteranceMs = (samples.length * 1000 / 16000).round();
+            if (_continuous) {
+              _lastDecodeMs = _decodeAccumMs;
+              _decodeAccumMs = 0;
+              onResult(text, true);
+              _sessionAudioBuffer.clear();
+            } else {
+              _utterance = _utterance.isEmpty ? text : '$_utterance $text';
+              onResult(_utterance, false);
+            }
           }
           _noVadBuffer.clear();
         }
@@ -475,6 +612,7 @@ class SttEngine {
     final recognizer = _recognizer;
     if (recognizer == null || samples.isEmpty) return '';
 
+    final sw = Stopwatch()..start();
     try {
       final stream = recognizer.createStream();
       stream.acceptWaveform(samples: samples, sampleRate: 16000);
@@ -485,6 +623,9 @@ class SttEngine {
     } catch (e) {
       debugPrint('[SttEngine] recognize error: $e');
       return '';
+    } finally {
+      sw.stop();
+      _decodeAccumMs += sw.elapsedMilliseconds;
     }
   }
 
@@ -564,6 +705,8 @@ class SttEngine {
     } catch (e) {
       debugPrint('[SttEngine] flushTail error: $e');
     }
+    _lastDecodeMs = _decodeAccumMs;
+    _decodeAccumMs = 0;
     final text = _utterance;
     _utterance = '';
     return text;
@@ -600,9 +743,12 @@ class SttEngine {
       await _recorder?.dispose();
     } catch (_) {}
     _recorder = null;
+    _muted = false;
 
     // Drain any speech segment still inside the VAD pipeline.
-    return flushTail();
+    final text = flushTail();
+    _continuous = false;
+    return text;
   }
 
   /// Whether the engine is currently listening.

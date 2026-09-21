@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -26,6 +27,52 @@ class EmergencyService {
   static const MethodChannel _channel = MethodChannel('itantra/sos_service');
 
   static bool get _supported => Platform.isAndroid;
+
+  // ── Hardware (volume-key) SOS shortcut ─────────────────────────
+
+  static final StreamController<void> _silentSosController =
+      StreamController<void>.broadcast();
+  static bool _handlerInstalled = false;
+
+  /// Fires when the user deliberately holds a volume key and the shortcut is
+  /// enabled in Settings.
+  ///
+  /// The key capture is native because a Flutter widget can only see key
+  /// events while it has focus; native capture also works when the UI is not
+  /// on screen but the process is alive (i.e. under [startStandby]). Whether
+  /// an SOS is actually *sent* is decided in Dart, so the preference is
+  /// applied in one place.
+  static Stream<void> get silentSosTriggered => _silentSosController.stream;
+
+  /// Install the native → Dart callback. Safe to call repeatedly.
+  static void initSilentSosHandler() {
+    if (!_supported || _handlerInstalled) return;
+    _handlerInstalled = true;
+    try {
+      _channel.setMethodCallHandler((call) async {
+        if (call.method == 'onSilentSos') {
+          if (!_silentSosController.isClosed) _silentSosController.add(null);
+        }
+        return null;
+      });
+    } catch (e) {
+      debugPrint('SOS: failed to install hardware shortcut handler: $e');
+      _handlerInstalled = false;
+    }
+  }
+
+  /// Turn native capture of the hardware shortcut on or off.
+  static Future<void> setSilentSosEnabled(bool enabled) async {
+    if (!_supported) return;
+    try {
+      await _channel.invokeMethod<bool>(
+        'setSilentSosEnabled',
+        {'enabled': enabled},
+      );
+    } catch (e) {
+      debugPrint('SOS: setSilentSosEnabled failed: $e');
+    }
+  }
 
   /// Ask Android to keep iTantra running as a foreground service.
   ///

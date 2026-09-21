@@ -21,7 +21,11 @@ class TtsModelDownloader {
       'https://huggingface.co/willwade/mms-tts-multilingual-models-onnx/resolve/main';
 
   /// MMS 3-letter language code per app language ISO 639 code.
-  /// Odia (`or`) is intentionally absent — no MMS model exists on HF.
+  ///
+  /// Every entry here was verified to exist on the upstream repo (both
+  /// `model.onnx` and `tokens.txt` return HTTP 200/30x). Languages absent from
+  /// this map have no MMS voice published and fall back to the platform
+  /// synthesizer, which still speaks them through the phone's own TTS.
   static const Map<String, String> _mmsCodes = {
     'hi': 'hin',
     'gu': 'guj',
@@ -32,6 +36,11 @@ class TtsModelDownloader {
     'ml': 'mal',
     'bn': 'ben',
     'en': 'eng',
+    // Verified additions — note Odia's MMS code is 'ory', not 'or'.
+    'or': 'ory',
+    'pa': 'pan',
+    'as': 'asm',
+    'mai': 'mai',
   };
 
   /// Whether a downloadable neural TTS model exists for [lang].
