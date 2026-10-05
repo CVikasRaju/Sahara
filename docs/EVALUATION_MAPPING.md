@@ -1,8 +1,16 @@
+<<<<<<< HEAD
 # Evaluation Mapping — Features vs. Quality Criteria
 
 Features mapped against quality criteria to guide build priorities.
 
 | Criterion | Weight | What Directly Moves This Number |
+=======
+# Evaluation Mapping — Features vs. SIH26173 Rubric
+
+Judges score against four stated criteria. This doc exists so your team (and your pitch deck) can justify every build decision against the rubric instead of building features for their own sake.
+
+| Rubric Criterion | Weight | What Directly Moves This Number |
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82
 |---|---|---|
 | **Efficiency** (model size, RAM/flash, idle CPU) | 20% | Single-language resident policy (ARCHITECTURE.md §2.2), INT8 quantization (ML_PIPELINE.md §3), battery/thermal-aware scheduling (ADDITIONAL_FEATURES.md #9) |
 | **Accuracy** (WER for STT, naturalness/flow for TTS) | 40% | Correct per-language tokenizer/phoneme mapping (ML_PIPELINE.md §6), quantization WER-delta validation, distress-intent detection as *additional* correctly-functioning inference (ADDITIONAL_FEATURES.md #1), confidence display + correction (#7) |
@@ -14,10 +22,17 @@ Features mapped against quality criteria to guide build priorities.
 Since Accuracy (40%) and Latency+Efficiency (40% combined) make up 80% of the score, and feature count isn't separately rewarded, the highest-leverage use of remaining time after the baseline works is:
 
 1. Tightening WER and RTF numbers on your actual target languages, with real benchmark data (not estimates).
+<<<<<<< HEAD
 2. Distress-detection + GPS stamping — cheap to build, and their value is immediately visible during a live demo ("phone said 'help' and location appeared automatically").
 3. Only then: translation, mesh, or the remaining lower-priority features — these are genuine differentiators but cost more build time per quality-point than #1-2.
 
 ## What to Show in a Live Demo
+=======
+2. Distress-detection + GPS stamping — cheap to build, and their value is legible to judges instantly during a live demo ("phone said 'help' and location appeared automatically").
+3. Only then: translation, mesh, or the remaining lower-priority features — these are genuine differentiators but cost more build time per rubric-point than #1-2.
+
+## What to Show in a Live Demo (Judges Score What They See)
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82
 
 - Two phones, airplane mode, visibly no internet — the offline claim has to be *demonstrated*, not asserted.
 - Real transcription appearing on screen as the person speaks (not a pre-recorded clip).

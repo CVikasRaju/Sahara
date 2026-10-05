@@ -1,6 +1,10 @@
 MIT License
 
+<<<<<<< HEAD
 Copyright (c) 2024 iTantra Contributors
+=======
+Copyright (c) 2026 iTantra Team
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -21,6 +25,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ---
+<<<<<<< HEAD
 
 Third-Party Model Licenses:
 
@@ -30,3 +35,9 @@ See docs/MODEL_LICENSES.md for full attribution and compliance details.
 
 The Silero VAD model is released under the MIT License.
 See https://github.com/snakers4/silero-vad for details.
+=======
+NOTE: This license covers the iTantra application code in this repository
+only. Downloaded model weights (AI4Bharat, Silero VAD, etc.) carry their own
+separate licenses — see docs/MODEL_LICENSES.md. Verify each before
+distribution or competition submission.
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82

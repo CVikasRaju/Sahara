@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # ── Dependencies ─────────────────────────────────────
 .dart_tool/
 .packages
@@ -58,3 +59,46 @@ android/replay_pid*.log
 # Local dev ML models (too large for git — downloaded at runtime)
 assets/models/stt/*/model.int8.onnx
 assets/models/stt/*/tokens.txt
+=======
+# Android Studio / IDE
+*.iml
+.idea/
+local.properties
+/captures
+.externalNativeBuildBluetoothSocket
+.cxx/
+
+# Build outputs
+.gradle/
+build/
+app/build/
+*.apk
+*.aab
+
+# Python Virtual Environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+# Heavy Neural Models & Raw Weights
+app/src/main/assets/models/**/*.onnx
+app/src/main/assets/models/**/*.bin
+<<<<<<< Updated upstream
+assets/models/
+assets/models_raw/
+
+.venv/
+.gradle/
+build/
+app/build/
+.idea/
+local.properties
+=======
+
+>>>>>>> Stashed changes
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82

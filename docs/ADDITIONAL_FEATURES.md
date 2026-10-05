@@ -1,11 +1,19 @@
 # Additional Features — Differentiators Beyond the Baseline Problem Statement
 
+<<<<<<< HEAD
 The baseline (offline STT -> text transfer -> offline TTS, two-phone PTT loop) is the core of the project. These features are optional, individually toggleable additions that extend the same architecture toward real-world disaster-response needs. Build them in the priority order below, only after the baseline is stable (see SETUP_AND_BUILD.md §5).
+=======
+The baseline (offline STT -> text transfer -> offline TTS, two-phone PTT loop) is what every competing team will build, since it's literally what the problem statement asks for. These features are optional, individually toggleable additions that extend the same architecture toward what ISRO/NDRF would actually need in the field. Build them in the priority order below, only after the baseline is stable (see SETUP_AND_BUILD.md §5).
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82
 
 ## Priority 1 — Highest value per hour of build time
 
 ### 1. Distress-Intent Auto-Detection
+<<<<<<< HEAD
 Run a lightweight keyword/intent classifier on the STT text output (not the audio) to detect distress language ("help", "trapped", "injured", "fire", equivalents per language) and auto-set the packet's Priority flag to Emergency — instead of requiring the sender to manually mark it. Directly strengthens the accuracy story since it's additional on-device inference, and it's a genuine safety feature that's field-relevant.
+=======
+Run a lightweight keyword/intent classifier on the STT text output (not the audio) to detect distress language ("help", "trapped", "injured", "fire", equivalents per language) and auto-set the packet's Priority flag to Emergency — instead of requiring the sender to manually mark it. Directly strengthens your Accuracy story since it's additional on-device inference, and it's a genuine safety feature ISRO evaluators will recognize as field-relevant.
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82
 - Implementation: a small classifier head on top of STT output text, or even a curated keyword-match list per language as a first pass if time is short.
 
 ### 2. GPS Location Stamping
@@ -16,6 +24,7 @@ If the target peer is out of range, queue the message locally (with its Sequence
 
 ## Priority 2 — Strong differentiator, more build effort
 
+<<<<<<< HEAD
 ### 4. Cross-Language Relay (Translation) — implemented with ML Kit
 Text already sits mid-pipeline, so the translation stage runs between decode and TTS: Person A speaking Kannada is *spoken aloud* in English on Person B's phone. The packet's own language field is the detected input language, so the receiver compares it against its listen language and only translates when they differ.
 
@@ -28,6 +37,11 @@ Text already sits mid-pipeline, so the translation stage runs between decode and
 **Honest coverage limit:** ML Kit ships models for 9 of the 23 languages — Hindi, Bengali, Gujarati, Kannada, Marathi, Tamil, Telugu, Urdu and English. Malayalam, Odia, Punjabi, Assamese, Nepali and every north-eastern language have no model; those pairs show the original text with a note naming the missing side. The Settings screen lists exactly which languages are unsupported.
 
 - The `HasSourceLang` extended payload flag (NETWORK_PROTOCOL.md §4) remains available for relay scenarios; the packet's header language is the primary source-language signal.
+=======
+### 4. Cross-Language Relay (Translation)
+Since text already sits mid-pipeline, add AI4Bharat IndicTrans2 (or similar) between STT and TTS so Person A speaking Gujarati can be heard by Person B in Tamil. Use the `HasSourceLang` extended payload flag (NETWORK_PROTOCOL.md §4) to signal the receiver which language to translate from. This is the feature most likely to make judges sit up — it turns the app from "same-language walkie-talkie" into genuine cross-team coordination, which is exactly the kind of thing multi-state disaster response actually needs.
+- Caveat: adds a third model to your resident-memory budget per active conversation — test footprint impact carefully against the 20% efficiency metric before committing to this as core rather than optional.
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82
 
 ### 5. Mesh / Multi-Hop Relay
 Beyond direct two-phone pairing, allow a message to hop through intermediate phones running the app to reach someone outside direct radio range (Wi-Fi Direct group owner election, or BT bridging). Reflects real disaster-mesh precedent (goTenna, Bridgefy-style approaches). Use the Sequence ID for hop-dedup (a relay node drops packets it's already forwarded, per NETWORK_PROTOCOL.md §5).
@@ -43,6 +57,7 @@ Show the sender the transcribed text with a confidence indicator before it trans
 ### 8. Group / Broadcast Mode
 One-to-many PTT instead of strictly 1:1, closer to how real disaster-response radio channels work (a command post broadcasting to a full team rather than pairing individually).
 
+<<<<<<< HEAD
 ### 8a. SOS Emergency Broadcast (implemented)
 A red SOS button that fans an emergency alert (Packet Type `0x2`, see NETWORK_PROTOCOL.md §Packet Type) to every device in radio range — not one peer, all of them. Receiving devices treat it as "raise the alarm": a full-screen red overlay, a spoken message via TTS, and a native alert that is engineered to be un-missable:
 
@@ -55,10 +70,15 @@ The sender gets a 3-second confirm countdown (auto-cancel) so a pocket trigger c
 
 ### 9. Battery/Thermal-Aware Model Scheduling
 Throttle or unload models based on battery level and thermal state, not just RAM. Field phones will be resource-starved in ways a lab-tested phone isn't — this is a footprint-metric point worth documenting even in a minimal implementation.
+=======
+### 9. Battery/Thermal-Aware Model Scheduling
+Throttle or unload models based on battery level and thermal state, not just RAM. Field phones will be resource-starved in ways a lab-tested phone isn't — this is a footprint-metric point worth making explicitly to judges even in a minimal implementation.
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82
 
 ### 10. Lightweight Payload Encryption
 AES on the small text payload — negligible performance cost given payload sizes are tens of bytes, but signals security-mindedness appropriate for a government-facing distress system.
 
+<<<<<<< HEAD
 ### 11. Settings & Persistence (implemented)
 A Settings screen backed by `shared_preferences` (`AppSettings`), loaded before the first frame so the UI never renders a default value and then corrects itself:
 
@@ -120,3 +140,7 @@ See §11. The name is a **structured payload field** (`HasSenderName` + a length
 
 ## What NOT to over-invest in
 Given the quality weights (Accuracy 40%, Latency 20%, Efficiency 20%), a flashy feature list does not substitute for hitting your core STT WER and end-to-end latency targets. If you're choosing between polishing feature #6-10 versus tightening your baseline numbers, tighten the baseline — see EVALUATION_MAPPING.md for how the criteria actually weigh these choices.
+=======
+## What NOT to over-invest in
+Given the rubric weights (Accuracy 40%, Latency 20%, Efficiency 20%), a flashy feature list does not substitute for hitting your core STT WER and end-to-end latency targets. If you're choosing between polishing feature #6-10 versus tightening your baseline numbers, tighten the baseline — see EVALUATION_MAPPING.md for how the rubric actually weighs these choices.
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82

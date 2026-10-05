@@ -2,6 +2,18 @@
 
 ## 1. Model Selection Matrix
 
+<<<<<<< HEAD
+=======
+**On tooling choice:** the problem statement names "TensorFlow Lite for Microcontrollers, PyTorch Mobile or
+similar" as recommended frameworks. This repo uses ONNX Runtime Mobile / sherpa-onnx instead — justified under
+the "or similar" clause because it is open-source, fully offline-capable, and has first-class Android bindings
+with built-in INT8 quantization support (see §3 below). If a judge asks why not the literally-named tools:
+TFLite Micro targets microcontroller-class hardware (far below an Android phone's capability and awkward for
+Kotlin/JNI integration), and PyTorch Mobile has weaker out-of-the-box support for the specific VITS/Conformer
+architectures AI4Bharat publishes. State this reasoning explicitly in your submission rather than leaving the
+substitution unexplained.
+
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82
 | Component | Model Family | Notes |
 |---|---|---|
 | VAD | Silero VAD | Tiny, well-tested, ONNX export available |
@@ -35,7 +47,11 @@ def compress_model(input_model_path: str, output_model_path: str):
     orig = os.path.getsize(input_model_path) / (1024 * 1024)
     quant = os.path.getsize(output_model_path) / (1024 * 1024)
     print(f"{input_model_path}: {orig:.1f}MB -> {quant:.1f}MB "
+<<<<<<< HEAD
           f"(1 - quant/orig)*100:.1f}% reduction")
+=======
+          f"({(1 - quant/orig)*100:.1f}% reduction)")
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82
 
 if __name__ == "__main__":
     compress_model("models/vits-kannada.onnx", "models/vits-kannada.int8.onnx")
@@ -73,4 +89,8 @@ Each Indic script (Devanagari, Kannada, Malayalam, Odia, Bengali, Tamil, Telugu 
 - Peak RAM during inference
 - Cold-load time when switching languages
 
+<<<<<<< HEAD
 Publish these numbers in your documentation — accuracy evaluation (the 40% quality weight) will want to see methodology, not just a claimed percentage.
+=======
+Publish these numbers in your submission — judges scoring the 40% accuracy weight will want to see methodology, not just a claimed percentage.
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82

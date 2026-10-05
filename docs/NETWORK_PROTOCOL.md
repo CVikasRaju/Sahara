@@ -34,6 +34,7 @@ Total fixed overhead: 12 bytes header + 2 bytes CRC = 14 bytes, regardless of pa
 
 ## 3. Language Code Table
 
+<<<<<<< HEAD
 The header's language field is a **4-bit nibble**, so it can only address 16 values, while iTantra supports the **22 languages of the Eighth Schedule plus English (23)**. The nibble therefore has a dual role:
 
 - `0x0 – 0xE` — a language written **directly** into the nibble (15 slots).
@@ -102,6 +103,28 @@ Who is speaking, so another operator knows whose voice they are hearing.
 - **Max 8 characters**, enforced by the Settings screen and clamped again by the encoder. Eight Devanagari characters are 24 bytes, so the length prefix counts **bytes** while the limit counts **characters**; the encoder therefore also caps the name at 64 bytes to guarantee it can never crowd the message out of a 512-byte payload.
 - The name is a **structured field, not a `"[Name]: message"` text prefix**. A prefix would be fed to the translation model (producing a mangled name in the spoken translation) and would consume bytes on every single message; the structured form costs nothing when no name is set, and lets the receiver render it separately and speak only the message.
 - An empty or whitespace-only name is encoded as *absent* — no length byte, no flag.
+=======
+| Code | Lang | Code | Lang |
+|---|---|---|---|
+| 0x0 | Hindi (hi) | 0x5 | Telugu (te) |
+| 0x1 | Gujarati (gu) | 0x6 | Malayalam (ml) |
+| 0x2 | Marathi (mr) | 0x7 | Odia (or) |
+| 0x3 | Kannada (kn) | 0x8 | Bengali (bn) |
+| 0x4 | Tamil (ta) | 0x9 | English (en-IN) |
+
+## 4. Extended Payload (Optional Sub-Fields for Differentiator Features)
+
+When Packet Type or a payload-internal flag indicates extended data, the payload begins with a 1-byte flags field before the text:
+
+```
+Byte 0 of payload:  [HasGPS:1][HasSourceLang:1][Reserved:6]
+Byte 1-8 (if HasGPS):     lat (float32) + lon (float32)
+Byte 9 (if HasSourceLang): original sender's language code, for translation-relay
+Remaining bytes: UTF-8 text
+```
+
+This keeps the common case (plain text, no extras) at zero overhead beyond the flag byte, while supporting GPS-stamped distress messages and cross-language relay without a second protocol.
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82
 
 ## 5. Reliability
 - **CRC-16 validation**: corrupted frames are silently dropped, not retransmitted automatically at this layer (retransmission is handled at the app layer via ack timeout, not baked into every packet, to keep overhead minimal on distress/emergency packets which favor speed over guaranteed delivery).
@@ -118,6 +141,7 @@ Who is speaking, so another operator knows whose voice they are hearing.
 | iTantra text packet + GPS + source-lang flag | ~55-95 bytes |
 
 The original draft's claim of "38 bytes in <5ms" for transfer over RFCOMM is plausible for the raw radio hop alone — but don't present that figure as your *total* system latency; it excludes STT inference, TTS inference, and connection handshake time. State it explicitly as "network transfer only" wherever you cite it, to avoid a judge catching the discrepancy against your end-to-end latency claim.
+<<<<<<< HEAD
 
 ## 7. Transport Implementation (as built)
 
@@ -187,3 +211,5 @@ silently.
 Half-duplex discipline: while a device is recording, processing or transmitting, an
 inbound frame is logged but not spoken, so the receiver's speaker cannot be picked up by
 its own microphone and re-transmitted.
+=======
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82

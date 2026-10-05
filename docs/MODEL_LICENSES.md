@@ -19,9 +19,15 @@ A team that builds a technically excellent app but ships a model with an unclear
 
 ## Rules
 1. **No proprietary voice-activation SDKs.** This explicitly rules out relying on closed-source components of Google Play Services for STT/TTS, per the problem statement's own restriction — even if it would be faster to integrate.
+<<<<<<< HEAD
 2. **Attribute everything** in your final documentation/README — model authors, license names, and links to source. This is expected practice for open-source model reuse and demonstrates compliance directly.
 3. **Keep a copy of each license file** alongside the model weights in your repo (`assets/models/<lang>/LICENSE`) so provenance travels with the artifact, not just with a README link that can go stale.
 4. If a model's license is ambiguous or research-only in a way that conflicts with your project's usage, **do not use it** — pick an alternative with a clear permissive license (MIT/Apache 2.0/BSD) instead of arguing interpretation.
+=======
+2. **Attribute everything** in your final submission/README — model authors, license names, and links to source. This is expected practice for open-source model reuse and demonstrates compliance to judges directly rather than making them dig for it.
+3. **Keep a copy of each license file** alongside the model weights in your repo (`assets/models/<lang>/LICENSE`) so provenance travels with the artifact, not just with a README link that can go stale.
+4. If a model's license is ambiguous or research-only in a way that conflicts with a hackathon submission's implied usage, **do not use it** — pick an alternative with a clear permissive license (MIT/Apache 2.0/BSD) instead of arguing interpretation with judges after the fact.
+>>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82
 
 ## Action Item
 Before your first internal demo, someone on the team should own this file and have every row filled in with a verified license and source link — not "TODO." Treat it as part of the deliverable, not paperwork.
