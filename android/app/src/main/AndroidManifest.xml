@@ -22,8 +22,15 @@
     <uses-permission
         android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
 
-    <!-- BLE mesh transport (Android 12+) -->
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"/>
+    <!-- BLE mesh transport (Android 12+).
+         BLUETOOTH_SCAN carries neverForLocation: iTantra does not derive
+         location from Bluetooth scan results (GPS is a separate, explicit
+         permission), and without the flag Android refuses to return any scan
+         results when the system Location toggle is off — which shows up as
+         "searching, 0 peers" even though Bluetooth itself is fine. -->
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"/>
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
     <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE"/>
     <!-- Legacy BLE permissions (Android 11 and below) -->

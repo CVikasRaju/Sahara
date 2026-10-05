@@ -1086,62 +1086,27 @@ class TransceiverController extends ChangeNotifier {
             _phase == TransceiverPhase.processing ||
             _phase == TransceiverPhase.transmitting);
 
-    // ── Cross-lingual translation + neural TTS (ARCHITECTURE.md §2.4) ──
-    // If the packet language differs from our receiver language, translate
-    // the text on-device, then speak the translation with the receiver
-    // language's neural voice.
+    // ── Language handling + neural TTS (ARCHITECTURE.md §2.4) ──
+    // Only same-language speech is shipped: a packet is spoken in the
+    // language the sender used, and ML Kit is never invoked. Translation was
+    // removed from the feature set, and leaving it on the receive path meant a
+    // hidden Google-Play-Services dependency (plus a runtime model download)
+    // could stall or fail every cross-language packet.
+    //
+    // The voice we speak with is therefore the *sender's* language, and the
+    // voice we pre-load is the same one — previously the receiver language was
+    // downloaded and then the packet language was spoken, so the wrong voice
+    // was prepared and playback fell back to platform TTS.
     final bool sameLang = packet.language.iso639 == _receiverLang.iso639;
-    String displayText = baseText;
-    String spokenText = packet.text;
-    Lang ttsLang = packet.language;
-    String? translationNote;
+    final String displayText = baseText;
+    final String spokenText = packet.text;
+    final Lang ttsLang = packet.language;
+    final String? translationNote =
+        sameLang ? null : 'Message in ${packet.language.name}';
 
-    if (!sameLang) {
-      if (!settings.translationEnabled) {
-        translationNote = 'Translation off — showing original text';
-      } else if (!TranslationEngine.supportsAll([packet.language, _receiverLang])) {
-        // ML Kit has no model for one of the two languages (e.g. Malayalam,
-        // Odia, Punjabi and every north-eastern language). Say which side is
-        // missing a model instead of silently showing the original text.
-        final missing = TranslationEngine.isSupported(packet.language)
-            ? _receiverLang.name
-            : packet.language.name;
-        translationNote =
-            'No offline model for $missing — showing original text';
-      } else {
-        // Ensure the receiver's voice is available (downloads once). Skipped
-        // while we are on air so a download never delays the next packet.
-        if (!busyTransmitting) await _ensureTtsModels(_receiverLang);
-
-        // Never blocks: returns false while the model downloads in the
-        // background, and this message falls back to the original text.
-        final ready = await translator.ensureModels(
-          packet.language,
-          _receiverLang,
-        );
-        if (ready) {
-          final translated = await translator.translate(
-            packet.text,
-            packet.language,
-            _receiverLang,
-          );
-          if (translated != null) {
-            displayText = '$baseText → $translated';
-            spokenText = translated;
-            ttsLang = _receiverLang;
-          } else {
-            translationNote = 'Translation failed — showing original text';
-          }
-        } else {
-          translationNote =
-              'Translation model downloading — this message stays in '
-              '${packet.language.name}, the next one will be translated';
-        }
-      }
-    } else if (!busyTransmitting) {
-      // Same language: still make sure the neural voice is ready.
-      await _ensureTtsModels(_receiverLang);
-    }
+    // Skipped while we are on air so a voice download never delays the next
+    // packet; the log still shows the text either way.
+    if (!busyTransmitting) await _ensureTtsModels(ttsLang);
 
     final int? ttsMs;
     if (!settings.canReceive) {

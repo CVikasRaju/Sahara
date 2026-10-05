@@ -11,7 +11,6 @@ import '../state/app_settings.dart';
 import '../state/transceiver_controller.dart';
 import 'settings_screen.dart';
 import 'widgets/alarm_overlay.dart';
-import 'widgets/offline_map.dart';
 import 'widgets/pipeline_strip.dart';
 import 'widgets/ptt_button.dart';
 import 'widgets/sos_button.dart';
@@ -114,72 +113,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
         );
       }
     }
-  }
-
-  /// Open the offline map for a distress position.
-  void _showPositionDialog({
-    required double lat,
-    required double lon,
-    required String label,
-  }) {
-    showDialog<void>(
-      context: context,
-      builder: (ctx) => Dialog(
-        backgroundColor: iTantraTheme.surface,
-        insetPadding: const EdgeInsets.all(16),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(14),
-          side: const BorderSide(color: iTantraTheme.border),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  const Icon(Icons.location_on,
-                      size: 18, color: iTantraTheme.danger),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      'Distress position',
-                      style: const TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w700,
-                        color: iTantraTheme.textPrimary,
-                      ),
-                    ),
-                  ),
-                  IconButton(
-                    icon: const Icon(Icons.close,
-                        size: 18, color: iTantraTheme.textMuted),
-                    onPressed: () => Navigator.of(ctx).pop(),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 8),
-              SizedBox(
-                height: 320,
-                width: 320,
-                child: OfflineMapView(lat: lat, lon: lon, label: label),
-              ),
-              const SizedBox(height: 8),
-              const Text(
-                'Rendered from tiles stored on this device. Drag to pan, '
-                'pinch or use + / − to zoom.',
-                style: TextStyle(
-                  fontSize: 10,
-                  color: iTantraTheme.textMuted,
-                  height: 1.35,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
   }
 
   @override
@@ -287,6 +220,16 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                       );
                     },
                   ),
+
+                  // ── Link Hint ─────────────────────────────────
+                  // A radio that is up but has found nobody is the single most
+                  // confusing state, so say what to check instead of showing a
+                  // silent "searching" badge.
+                  if (_transceiverOn &&
+                      ctrl.meshActive &&
+                      !ctrl.hasReachablePeer &&
+                      ctrl.linkStats.searchHint.isNotEmpty)
+                    _LinkHint(text: ctrl.linkStats.searchHint),
 
                   // ── Model Download Banner ─────────────────────
                   if (ctrl.modelsDownloading)
@@ -557,11 +500,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                     flex: 3,
                     child: _PacketLog(
                       log: ctrl.log,
-                      onOpenMap: (entry) => _showPositionDialog(
-                        lat: entry.lat!,
-                        lon: entry.lon!,
-                        label: entry.senderName ?? entry.langName,
-                      ),
                     ),
                   ),
                 ],
@@ -580,13 +518,6 @@ class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
                 durationSeconds: ctrl.alarmIsSos
                     ? TransceiverController.kSosAlertSeconds.inSeconds
                     : TransceiverController.kEmergencyAlertSeconds.inSeconds,
-                onViewMap: ctrl.alarmHasPosition
-                    ? () => _showPositionDialog(
-                          lat: ctrl.alarmLat!,
-                          lon: ctrl.alarmLon!,
-                          label: ctrl.alarmSender ?? ctrl.alarmLabel,
-                        )
-                    : null,
               ),
           ],
         );
@@ -771,6 +702,45 @@ class _LinkBadge extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+/// One-line, actionable guidance while the radios are up but peerless.
+class _LinkHint extends StatelessWidget {
+  final String text;
+
+  const _LinkHint({required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+      decoration: BoxDecoration(
+        color: iTantraTheme.surface,
+        border: Border.all(color: iTantraTheme.border),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.wifi_tethering,
+              size: 14, color: iTantraTheme.textSecondary),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(
+                fontSize: 11,
+                color: iTantraTheme.textSecondary,
+                height: 1.3,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -986,6 +956,9 @@ class _PacketLog extends StatelessWidget {
   /// Opens the offline map for an entry that carries a position.
   final ValueChanged<LogEntry>? onOpenMap;
 
+  // The map view is hidden in this build; the callback is kept wired so the
+  // feature can be re-enabled without touching the log card.
+  // ignore: unused_element_parameter
   const _PacketLog({required this.log, this.onOpenMap});
 
   @override

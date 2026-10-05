@@ -58,6 +58,10 @@ class BleMeshTransport {
   static const int _ibfsMagic0 = 0x49; // 'I'
   static const int _ibfsMagic1 = 0x54; // 'T'
 
+  /// Local name carried in the advertisement's scan response. Used both for
+  /// advertising and as a discovery fallback (see [_onDiscovered]).
+  static const String advertisedName = 'iTantra';
+
   final PeripheralManager _peripheral = PeripheralManager();
   final CentralManager _central = CentralManager();
 
@@ -184,7 +188,7 @@ class BleMeshTransport {
       await _peripheral.addService(service);
 
       await _peripheral.startAdvertising(Advertisement(
-        name: 'iTantra',
+        name: advertisedName,
         serviceUUIDs: [serviceUuid],
       ));
 
@@ -380,7 +384,21 @@ class BleMeshTransport {
     final hasService =
         advertisement.serviceUUIDs.contains(serviceUuid) ||
             advertisement.serviceData.containsKey(serviceUuid);
-    if (!hasService) return;
+
+    // Several Android stacks do not surface 128-bit service UUIDs in
+    // `ScanRecord.getServiceUuids()` — the bytes arrive but are never parsed
+    // into the list — so a strict UUID check silently rejects a real iTantra
+    // node and the mesh sits at "searching, 0 peers" forever. The peer also
+    // advertises its local name in the scan response, so accept either signal.
+    final hasName = advertisement.name == advertisedName;
+    if (!hasService && !hasName) {
+      debugPrint('BleMesh: ignoring ${advertisement.name ?? 'unnamed'} '
+          '(${args.peripheral.uuid.value.join(',')}) — not an iTantra node');
+      return;
+    }
+    debugPrint('BleMesh: found iTantra node via '
+        '${hasService ? 'service UUID' : 'advertised name'} '
+        '(rssi ${args.rssi})');
 
     final key = _key(args.peripheral.uuid);
     final now = DateTime.now().millisecondsSinceEpoch;

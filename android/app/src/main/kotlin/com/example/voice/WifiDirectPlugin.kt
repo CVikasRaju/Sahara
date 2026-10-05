@@ -71,6 +71,9 @@ class WifiDirectPlugin(
         /** Minimum gap between group-formation attempts. */
         const val CONNECT_RETRY_MS = 8_000L
 
+        /** Delay between asking for a discovery pass and reading the peers. */
+        const val PEER_POLL_DELAY_MS = 2_000L
+
         /** An owner with no client for this long gives up its group. */
         const val OWNER_IDLE_RESET_MS = 25_000L
 
@@ -246,6 +249,12 @@ class WifiDirectPlugin(
             if (!running) return
             reapIdleOwnerGroup()
             discoverPeers()
+            // Poll the peer list directly instead of waiting only for
+            // WIFI_P2P_PEERS_CHANGED_ACTION. Some OEM stacks never broadcast
+            // that action, which leaves discovery stuck at "searching" with
+            // zero peers forever. discoverPeers() needs a moment to produce
+            // results, so the poll is offset slightly.
+            handler.postDelayed({ requestPeers() }, PEER_POLL_DELAY_MS)
             handler.postDelayed(this, DISCOVER_INTERVAL_MS)
         }
     }

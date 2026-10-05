@@ -4,8 +4,6 @@ import 'package:provider/provider.dart';
 
 import '../core/theme.dart';
 import '../ml/ibfs.dart' show kMaxSenderNameChars;
-import '../ml/languages.dart';
-import '../ml/translation_engine.dart';
 import '../state/app_settings.dart';
 import '../state/transceiver_controller.dart';
 
@@ -186,7 +184,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
               const Text(
                 'Lower it if the neural voice sounds rushed, raise it if '
-                'translated speech is too slow to follow.',
+                'the voice is too slow to follow.',
                 style: TextStyle(
                   fontSize: 11,
                   color: iTantraTheme.textMuted,
@@ -253,40 +251,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
             ],
           ),
 
-          // ── Translation ───────────────────────────────────────
-          _Section(
-            title: 'Cross-language translation',
-            subtitle: 'Translates an incoming message into your listen '
-                'language before speaking it.',
-            children: [
-              _SwitchRow(
-                title: 'Translate incoming messages',
-                subtitle: 'Models download once per language (~30 MB) and then '
-                    'work with no network at all.',
-                value: settings.translationEnabled,
-                onChanged: (v) => settings.translationEnabled = v,
-              ),
-              const SizedBox(height: 8),
-              ValueListenableBuilder<String?>(
-                valueListenable: ctrl.translator.status,
-                builder: (context, status, _) {
-                  if (status == null) return const SizedBox.shrink();
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 8),
-                    child: Text(
-                      status,
-                      style: const TextStyle(
-                        fontSize: 11,
-                        color: iTantraTheme.saffron,
-                      ),
-                    ),
-                  );
-                },
-              ),
-              const _TranslationCoverage(),
-            ],
-          ),
-
           // ── Storage ───────────────────────────────────────────
           _Section(
             title: 'Storage & rescue log',
@@ -299,17 +263,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 detail: 'Removes cached speech clips, the packet log and any '
                     'undelivered queued messages.',
                 onTap: () => _clear(context, ctrl, const {}),
-              ),
-              _ActionRow(
-                icon: Icons.translate,
-                label: 'Delete translation models',
-                detail: 'Frees the on-device translation models. They '
-                    're-download on demand.',
-                onTap: () => _clear(
-                  context,
-                  ctrl,
-                  const {_ClearOption.translationModels},
-                ),
               ),
               _ActionRow(
                 icon: Icons.memory,
@@ -660,7 +613,7 @@ class _RoleExplainer extends StatelessWidget {
         'Sender only: microphone, live transcript and latency benchmarks '
             '(STT ms, RTF). Incoming audio is logged but never played.',
       AppRole.ttsOnly =>
-        'Receiver only: mesh reception, translation and loud voice playback. '
+        'Receiver only: mesh reception and loud voice playback. '
             'The microphone is disabled.',
     };
     return Text(
@@ -670,39 +623,6 @@ class _RoleExplainer extends StatelessWidget {
         color: iTantraTheme.textSecondary,
         height: 1.35,
       ),
-    );
-  }
-}
-
-class _TranslationCoverage extends StatelessWidget {
-  const _TranslationCoverage();
-
-  @override
-  Widget build(BuildContext context) {
-    final unsupported = TranslationEngine.unsupportedOf(kLanguages);
-    final supported = kLanguages.length - unsupported.length;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          'On-device translation covers $supported of ${kLanguages.length} '
-          'languages. The rest show the original text.',
-          style: const TextStyle(
-            fontSize: 11,
-            color: iTantraTheme.textSecondary,
-            height: 1.35,
-          ),
-        ),
-        const SizedBox(height: 4),
-        Text(
-          unsupported.map((l) => l.name).join(', '),
-          style: const TextStyle(
-            fontSize: 10,
-            color: iTantraTheme.textMuted,
-            height: 1.35,
-          ),
-        ),
-      ],
     );
   }
 }

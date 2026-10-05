@@ -69,6 +69,17 @@ class LinkStats {
         'Direct — no network or hotspot needed).';
   }
 
+  /// Actionable guidance shown while a radio is up but no peer has been found
+  /// yet. Without it "searching" looks identical to "broken".
+  String get searchHint {
+    if (hasPeers) return '';
+    if (!anyRunning) return failureHint ?? '';
+    return 'Radios are up but no peer yet — keep iTantra open on the other '
+        'phone, and make sure Bluetooth and Wi-Fi are on and Location is '
+        'enabled (Android hides BLE and Wi-Fi Direct scan results when '
+        'Location is off).';
+  }
+
   /// Long form for tooltips / the status banner.
   String get detail {
     final ble = bleRunning ? 'BLE $bleStatus' : 'BLE off';
