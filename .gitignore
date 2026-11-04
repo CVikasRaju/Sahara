@@ -1,29 +1,32 @@
-<<<<<<< HEAD
-# ── Dependencies ─────────────────────────────────────
+# ── Flutter / Dart ──────────────────────────────────
 .dart_tool/
 .packages
 .flutter-plugins
 .flutter-plugins-dependencies
 
-# ── Build outputs ────────────────────────────────────
+# ── Build outputs ───────────────────────────────────
 build/
 dist/
 *.apk
 *.aab
 *.ipa
+# The shipped release APK is tracked on purpose
+!release/*.apk
 
-# ── Android ──────────────────────────────────────────
+# ── Android ─────────────────────────────────────────
 android/.gradle/
 android/.kotlin/
 android/app/build/
 android/local.properties
 android/key.properties
+android/hs_err_pid*.log
+android/replay_pid*.log
+android/captures/
+android/.cxx/
 *.jks
 *.keystore
-**/*.keystore
-**/*.jks
 
-# ── IDE ──────────────────────────────────────────────
+# ── IDE ─────────────────────────────────────────────
 .idea/
 .vscode/
 *.iml
@@ -31,74 +34,23 @@ android/key.properties
 *.swo
 *~
 
-# ── Environment / Secrets ────────────────────────────
+# ── Environment / Secrets ───────────────────────────
 .env
 .env.local
 .env.*.local
 *.pem
-*.key
 
-# ── OS ───────────────────────────────────────────────
+# ── OS ──────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 desktop.ini
 ehthumbs.db
 
-# ── Java crash logs ──────────────────────────────────
-android/hs_err_pid*.log
-android/replay_pid*.log
-
-# ── Archives ─────────────────────────────────────────
-*.tar.gz
-*.zip
-*.7z
-
-# Widget Preview
-.widget_preview/
-
-# Local dev ML models (too large for git — downloaded at runtime)
-assets/models/stt/*/model.int8.onnx
-assets/models/stt/*/tokens.txt
-=======
-# Android Studio / IDE
-*.iml
-.idea/
-local.properties
-/captures
-.externalNativeBuildBluetoothSocket
-.cxx/
-
-# Build outputs
-.gradle/
-build/
-app/build/
-*.apk
-*.aab
-
-# Python Virtual Environment
-.venv/
-venv/
-__pycache__/
-*.pyc
-
-# OS Specific
-.DS_Store
-Thumbs.db
-
-# Heavy Neural Models & Raw Weights
-app/src/main/assets/models/**/*.onnx
-app/src/main/assets/models/**/*.bin
-<<<<<<< Updated upstream
-assets/models/
+# ── Local ML models (downloaded at runtime; too large for git) ──
+# The APK bundles only the VAD model, which stays tracked.
+assets/models/stt/
 assets/models_raw/
 
-.venv/
-.gradle/
-build/
-app/build/
-.idea/
-local.properties
-=======
-
->>>>>>> Stashed changes
->>>>>>> 84931fdf46cbb9487d84f2fa7ee6f1062f112c82
+# ── Tooling ─────────────────────────────────────────
+.widget_preview/
+.freebuff/

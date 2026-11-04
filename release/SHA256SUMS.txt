@@ -1,0 +1,1 @@
+cfe4ac9f0eadc844eaaed4a319eb7784e42b7c9b8d3a137a2f1b25b7d27eda8f *app-arm64-v8a-release.apk
